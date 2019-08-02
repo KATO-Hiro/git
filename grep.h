@@ -86,6 +86,7 @@ struct grep_pat {
 	pcre2_code *pcre2_pattern;
 	pcre2_match_data *pcre2_match_data;
 	pcre2_compile_context *pcre2_compile_context;
+	const uint8_t *pcre2_tables;
 	uint32_t pcre2_jit_on;
 	unsigned fixed:1;
 	unsigned is_fixed:1;
