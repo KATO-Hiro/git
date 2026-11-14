@@ -2,7 +2,6 @@
 
 test_description='check handling of disallowed .gitmodule urls'
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 
 test_expect_success 'setup' '
@@ -34,14 +33,15 @@ test_expect_success 'fsck accepts protected dash' '
 '
 
 test_expect_success 'remove ./ protection from .gitmodules url' '
-	perl -i -pe "s{\./}{}" .gitmodules &&
+	sed "s|\./||" .gitmodules >.gitmodules.munged &&
+	mv .gitmodules.munged .gitmodules &&
 	git commit -am "drop protection"
 '
 
 test_expect_success 'clone rejects unprotected dash' '
 	test_when_finished "rm -rf dst" &&
 	test_must_fail git clone --recurse-submodules . dst 2>err &&
-	test_i18ngrep ignoring err
+	test_grep ignoring err
 '
 
 test_expect_success 'fsck rejects unprotected dash' '
@@ -49,7 +49,7 @@ test_expect_success 'fsck rejects unprotected dash' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'trailing backslash is handled correctly' '
@@ -63,7 +63,7 @@ test_expect_success 'trailing backslash is handled correctly' '
 	mv .new .gitmodules &&
 	git commit -am "Add testmodule" &&
 	test_must_fail git clone --verbose --recurse-submodules . dolly 2>err &&
-	test_i18ngrep ! "unknown option" err
+	test_grep ! "unknown option" err
 '
 
 test_expect_success 'fsck rejects missing URL scheme' '
@@ -79,7 +79,7 @@ test_expect_success 'fsck rejects missing URL scheme' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck rejects relative URL resolving to missing scheme' '
@@ -95,7 +95,7 @@ test_expect_success 'fsck rejects relative URL resolving to missing scheme' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck rejects empty URL scheme' '
@@ -111,7 +111,7 @@ test_expect_success 'fsck rejects empty URL scheme' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck rejects relative URL resolving to empty scheme' '
@@ -127,7 +127,7 @@ test_expect_success 'fsck rejects relative URL resolving to empty scheme' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck rejects empty hostname' '
@@ -143,7 +143,7 @@ test_expect_success 'fsck rejects empty hostname' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck rejects relative url that produced empty hostname' '
@@ -159,7 +159,7 @@ test_expect_success 'fsck rejects relative url that produced empty hostname' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck permits embedded newline with unrecognized scheme' '
@@ -189,7 +189,7 @@ test_expect_success 'fsck rejects embedded newline in url' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck rejects embedded newline in relative url' '
@@ -204,7 +204,7 @@ test_expect_success 'fsck rejects embedded newline in relative url' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_expect_success 'fsck rejects embedded newline in git url' '
@@ -219,7 +219,7 @@ test_expect_success 'fsck rejects embedded newline in git url' '
 	git init --bare dst &&
 	git -C dst config transfer.fsckObjects true &&
 	test_must_fail git push dst HEAD 2>err &&
-	grep gitmodulesUrl err
+	test_grep gitmodulesUrl err
 '
 
 test_done

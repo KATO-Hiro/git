@@ -1,20 +1,19 @@
 #include "git-compat-util.h"
-#include "cache-tree.h"
 #include "hex.h"
 #include "tree.h"
 #include "object-name.h"
-#include "object-store-ll.h"
-#include "blob.h"
+#include "odb.h"
 #include "commit.h"
-#include "tag.h"
 #include "alloc.h"
 #include "tree-walk.h"
 #include "repository.h"
+#include "environment.h"
 
 const char *tree_type = "tree";
 
 int read_tree_at(struct repository *r,
 		 struct tree *tree, struct strbuf *base,
+		 int depth,
 		 const struct pathspec *pathspec,
 		 read_tree_fn_t fn, void *context)
 {
@@ -24,10 +23,13 @@ int read_tree_at(struct repository *r,
 	int len, oldlen = base->len;
 	enum interesting retval = entry_not_interesting;
 
-	if (parse_tree(tree))
+	if (depth > r->settings.max_allowed_tree_depth)
+		return error("exceeded maximum allowed tree depth");
+
+	if (repo_parse_tree(r, tree))
 		return -1;
 
-	init_tree_desc(&desc, tree->buffer, tree->size);
+	init_tree_desc(&desc, &tree->object.oid, tree->buffer, tree->size);
 
 	while (tree_entry(&desc, &entry)) {
 		if (retval != all_entries_interesting) {
@@ -74,7 +76,7 @@ int read_tree_at(struct repository *r,
 		strbuf_add(base, entry.path, len);
 		strbuf_addch(base, '/');
 		retval = read_tree_at(r, lookup_tree(r, &oid),
-				      base, pathspec,
+				      base, depth + 1, pathspec,
 				      fn, context);
 		strbuf_setlen(base, oldlen);
 		if (retval)
@@ -89,7 +91,7 @@ int read_tree(struct repository *r,
 	      read_tree_fn_t fn, void *context)
 {
 	struct strbuf sb = STRBUF_INIT;
-	int ret = read_tree_at(r, tree, &sb, pathspec, fn, context);
+	int ret = read_tree_at(r, tree, &sb, 0, pathspec, fn, context);
 	strbuf_release(&sb);
 	return ret;
 }
@@ -181,16 +183,16 @@ int parse_tree_buffer(struct tree *item, void *buffer, unsigned long size)
 	return 0;
 }
 
-int parse_tree_gently(struct tree *item, int quiet_on_missing)
+int repo_parse_tree_gently(struct repository *r, struct tree *item,
+			   int quiet_on_missing)
 {
 	 enum object_type type;
 	 void *buffer;
-	 unsigned long size;
+	 size_t size;
 
 	if (item->object.parsed)
 		return 0;
-	buffer = repo_read_object_file(the_repository, &item->object.oid,
-				       &type, &size);
+	buffer = odb_read_object(r->objects, &item->object.oid, &type, &size);
 	if (!buffer)
 		return quiet_on_missing ? -1 :
 			error("Could not read %s",
@@ -210,9 +212,9 @@ void free_tree_buffer(struct tree *tree)
 	tree->object.parsed = 0;
 }
 
-struct tree *parse_tree_indirect(const struct object_id *oid)
+struct tree *repo_parse_tree_indirect(struct repository *r,
+				      const struct object_id *oid)
 {
-	struct repository *r = the_repository;
 	struct object *obj = parse_object(r, oid);
 	return (struct tree *)repo_peel_to_type(r, NULL, 0, obj, OBJ_TREE);
 }

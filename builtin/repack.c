@@ -1,44 +1,47 @@
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
 #include "config.h"
-#include "dir.h"
 #include "environment.h"
-#include "gettext.h"
-#include "hex.h"
 #include "parse-options.h"
 #include "path.h"
 #include "run-command.h"
 #include "server-info.h"
-#include "sigchain.h"
-#include "strbuf.h"
 #include "string-list.h"
-#include "strvec.h"
 #include "midx.h"
 #include "packfile.h"
 #include "prune-packed.h"
-#include "object-store-ll.h"
 #include "promisor-remote.h"
+#include "repack.h"
 #include "shallow.h"
-#include "pack.h"
-#include "pack-bitmap.h"
-#include "refs.h"
+#include "list-objects-filter-options.h"
+#include "oidset.h"
+#include "hex.h"
+#include "wt-status.h"
+#include "read-cache-ll.h"
 
 #define ALL_INTO_ONE 1
 #define LOOSEN_UNREACHABLE 2
 #define PACK_CRUFT 4
 
 #define DELETE_PACK 1
-#define CRUFT_PACK 2
+#define RETAIN_PACK 2
 
 static int pack_everything;
-static int delta_base_offset = 1;
-static int pack_kept_objects = -1;
 static int write_bitmaps = -1;
 static int use_delta_islands;
 static int run_update_server_info = 1;
 static char *packdir, *packtmp_name, *packtmp;
+static int midx_must_contain_cruft = 1;
+static int drop_filtered;
+static int dry_run;
+static int write_bitmaps_given;
 
 static const char *const git_repack_usage[] = {
-	N_("git repack [<options>]"),
+	N_("git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q] [-b] [-m]\n"
+	   "[--window=<n>] [--depth=<n>] [--threads=<n>] [--keep-pack=<pack-name>]\n"
+	   "[--write-midx[=<mode>]] [--name-hash-version=<n>] [--path-walk]\n"
+	   "[--filter=<filter-spec>] [--drop-filtered [--dry-run]]"),
 	NULL
 };
 
@@ -47,28 +50,28 @@ static const char incremental_bitmap_conflict_error[] = N_(
 "--no-write-bitmap-index or disable the pack.writeBitmaps configuration."
 );
 
-struct pack_objects_args {
-	const char *window;
-	const char *window_memory;
-	const char *depth;
-	const char *threads;
-	const char *max_pack_size;
-	int no_reuse_delta;
-	int no_reuse_object;
-	int quiet;
-	int local;
+#define DEFAULT_MIDX_SPLIT_FACTOR 2
+#define DEFAULT_MIDX_NEW_LAYER_THRESHOLD 8
+
+struct repack_config_ctx {
+	struct pack_objects_args *po_args;
+	struct pack_objects_args *cruft_po_args;
+	int midx_split_factor;
+	int midx_new_layer_threshold;
 };
 
 static int repack_config(const char *var, const char *value,
 			 const struct config_context *ctx, void *cb)
 {
-	struct pack_objects_args *cruft_po_args = cb;
+	struct repack_config_ctx *repack_ctx = cb;
+	struct pack_objects_args *po_args = repack_ctx->po_args;
+	struct pack_objects_args *cruft_po_args = repack_ctx->cruft_po_args;
 	if (!strcmp(var, "repack.usedeltabaseoffset")) {
-		delta_base_offset = git_config_bool(var, value);
+		po_args->delta_base_offset = git_config_bool(var, value);
 		return 0;
 	}
 	if (!strcmp(var, "repack.packkeptobjects")) {
-		pack_kept_objects = git_config_bool(var, value);
+		po_args->pack_kept_objects = git_config_bool(var, value);
 		return 0;
 	}
 	if (!strcmp(var, "repack.writebitmaps") ||
@@ -84,719 +87,106 @@ static int repack_config(const char *var, const char *value,
 		run_update_server_info = git_config_bool(var, value);
 		return 0;
 	}
-	if (!strcmp(var, "repack.cruftwindow"))
+	if (!strcmp(var, "repack.cruftwindow")) {
+		free(cruft_po_args->window);
 		return git_config_string(&cruft_po_args->window, var, value);
-	if (!strcmp(var, "repack.cruftwindowmemory"))
+	}
+	if (!strcmp(var, "repack.cruftwindowmemory")) {
+		free(cruft_po_args->window_memory);
 		return git_config_string(&cruft_po_args->window_memory, var, value);
-	if (!strcmp(var, "repack.cruftdepth"))
+	}
+	if (!strcmp(var, "repack.cruftdepth")) {
+		free(cruft_po_args->depth);
 		return git_config_string(&cruft_po_args->depth, var, value);
-	if (!strcmp(var, "repack.cruftthreads"))
+	}
+	if (!strcmp(var, "repack.cruftthreads")) {
+		free(cruft_po_args->threads);
 		return git_config_string(&cruft_po_args->threads, var, value);
+	}
+	if (!strcmp(var, "repack.midxmustcontaincruft")) {
+		midx_must_contain_cruft = git_config_bool(var, value);
+		return 0;
+	}
+	if (!strcmp(var, "repack.midxsplitfactor")) {
+		repack_ctx->midx_split_factor = git_config_int(var, value,
+							       ctx->kvi);
+		return 0;
+	}
+	if (!strcmp(var, "repack.midxnewlayerthreshold")) {
+		repack_ctx->midx_new_layer_threshold = git_config_int(var, value,
+								      ctx->kvi);
+		return 0;
+	}
 	return git_default_config(var, value, ctx, cb);
 }
 
-/*
- * Adds all packs hex strings (pack-$HASH) to either fname_nonkept_list
- * or fname_kept_list based on whether each pack has a corresponding
- * .keep file or not.  Packs without a .keep file are not to be kept
- * if we are going to pack everything into one file.
- */
-static void collect_pack_filenames(struct string_list *fname_nonkept_list,
-				   struct string_list *fname_kept_list,
-				   const struct string_list *extra_keep)
+static int option_parse_write_bitmaps(const struct option *opt, const char *arg,
+				      int unset)
 {
-	struct packed_git *p;
-	struct strbuf buf = STRBUF_INIT;
-
-	for (p = get_all_packs(the_repository); p; p = p->next) {
-		int i;
-		const char *base;
-
-		if (!p->pack_local)
-			continue;
-
-		base = pack_basename(p);
-
-		for (i = 0; i < extra_keep->nr; i++)
-			if (!fspathcmp(base, extra_keep->items[i].string))
-				break;
-
-		strbuf_reset(&buf);
-		strbuf_addstr(&buf, base);
-		strbuf_strip_suffix(&buf, ".pack");
-
-		if ((extra_keep->nr > 0 && i < extra_keep->nr) || p->pack_keep)
-			string_list_append(fname_kept_list, buf.buf);
-		else {
-			struct string_list_item *item;
-			item = string_list_append(fname_nonkept_list, buf.buf);
-			if (p->is_cruft)
-				item->util = (void*)(uintptr_t)CRUFT_PACK;
-		}
-	}
-
-	string_list_sort(fname_kept_list);
-	strbuf_release(&buf);
-}
-
-static void remove_redundant_pack(const char *dir_name, const char *base_name)
-{
-	struct strbuf buf = STRBUF_INIT;
-	struct multi_pack_index *m = get_local_multi_pack_index(the_repository);
-	strbuf_addf(&buf, "%s.pack", base_name);
-	if (m && midx_contains_pack(m, buf.buf))
-		clear_midx_file(the_repository);
-	strbuf_insertf(&buf, 0, "%s/", dir_name);
-	unlink_pack_path(buf.buf, 1);
-	strbuf_release(&buf);
-}
-
-static void prepare_pack_objects(struct child_process *cmd,
-				 const struct pack_objects_args *args,
-				 const char *out)
-{
-	strvec_push(&cmd->args, "pack-objects");
-	if (args->window)
-		strvec_pushf(&cmd->args, "--window=%s", args->window);
-	if (args->window_memory)
-		strvec_pushf(&cmd->args, "--window-memory=%s", args->window_memory);
-	if (args->depth)
-		strvec_pushf(&cmd->args, "--depth=%s", args->depth);
-	if (args->threads)
-		strvec_pushf(&cmd->args, "--threads=%s", args->threads);
-	if (args->max_pack_size)
-		strvec_pushf(&cmd->args, "--max-pack-size=%s", args->max_pack_size);
-	if (args->no_reuse_delta)
-		strvec_pushf(&cmd->args, "--no-reuse-delta");
-	if (args->no_reuse_object)
-		strvec_pushf(&cmd->args, "--no-reuse-object");
-	if (args->local)
-		strvec_push(&cmd->args,  "--local");
-	if (args->quiet)
-		strvec_push(&cmd->args,  "--quiet");
-	if (delta_base_offset)
-		strvec_push(&cmd->args,  "--delta-base-offset");
-	strvec_push(&cmd->args, out);
-	cmd->git_cmd = 1;
-	cmd->out = -1;
-}
-
-/*
- * Write oid to the given struct child_process's stdin, starting it first if
- * necessary.
- */
-static int write_oid(const struct object_id *oid,
-		     struct packed_git *pack UNUSED,
-		     uint32_t pos UNUSED, void *data)
-{
-	struct child_process *cmd = data;
-
-	if (cmd->in == -1) {
-		if (start_command(cmd))
-			die(_("could not start pack-objects to repack promisor objects"));
-	}
-
-	xwrite(cmd->in, oid_to_hex(oid), the_hash_algo->hexsz);
-	xwrite(cmd->in, "\n", 1);
-	return 0;
-}
-
-static struct {
-	const char *name;
-	unsigned optional:1;
-} exts[] = {
-	{".pack"},
-	{".rev", 1},
-	{".mtimes", 1},
-	{".bitmap", 1},
-	{".promisor", 1},
-	{".idx"},
-};
-
-struct generated_pack_data {
-	struct tempfile *tempfiles[ARRAY_SIZE(exts)];
-};
-
-static struct generated_pack_data *populate_pack_exts(const char *name)
-{
-	struct stat statbuf;
-	struct strbuf path = STRBUF_INIT;
-	struct generated_pack_data *data = xcalloc(1, sizeof(*data));
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(exts); i++) {
-		strbuf_reset(&path);
-		strbuf_addf(&path, "%s-%s%s", packtmp, name, exts[i].name);
-
-		if (stat(path.buf, &statbuf))
-			continue;
-
-		data->tempfiles[i] = register_tempfile(path.buf);
-	}
-
-	strbuf_release(&path);
-	return data;
-}
-
-static void repack_promisor_objects(const struct pack_objects_args *args,
-				    struct string_list *names)
-{
-	struct child_process cmd = CHILD_PROCESS_INIT;
-	FILE *out;
-	struct strbuf line = STRBUF_INIT;
-
-	prepare_pack_objects(&cmd, args, packtmp);
-	cmd.in = -1;
-
-	/*
-	 * NEEDSWORK: Giving pack-objects only the OIDs without any ordering
-	 * hints may result in suboptimal deltas in the resulting pack. See if
-	 * the OIDs can be sent with fake paths such that pack-objects can use a
-	 * {type -> existing pack order} ordering when computing deltas instead
-	 * of a {type -> size} ordering, which may produce better deltas.
-	 */
-	for_each_packed_object(write_oid, &cmd,
-			       FOR_EACH_OBJECT_PROMISOR_ONLY);
-
-	if (cmd.in == -1) {
-		/* No packed objects; cmd was never started */
-		child_process_clear(&cmd);
-		return;
-	}
-
-	close(cmd.in);
-
-	out = xfdopen(cmd.out, "r");
-	while (strbuf_getline_lf(&line, out) != EOF) {
-		struct string_list_item *item;
-		char *promisor_name;
-
-		if (line.len != the_hash_algo->hexsz)
-			die(_("repack: Expecting full hex object ID lines only from pack-objects."));
-		item = string_list_append(names, line.buf);
-
-		/*
-		 * pack-objects creates the .pack and .idx files, but not the
-		 * .promisor file. Create the .promisor file, which is empty.
-		 *
-		 * NEEDSWORK: fetch-pack sometimes generates non-empty
-		 * .promisor files containing the ref names and associated
-		 * hashes at the point of generation of the corresponding
-		 * packfile, but this would not preserve their contents. Maybe
-		 * concatenate the contents of all .promisor files instead of
-		 * just creating a new empty file.
-		 */
-		promisor_name = mkpathdup("%s-%s.promisor", packtmp,
-					  line.buf);
-		write_promisor_file(promisor_name, NULL, 0);
-
-		item->util = populate_pack_exts(item->string);
-
-		free(promisor_name);
-	}
-	fclose(out);
-	if (finish_command(&cmd))
-		die(_("could not finish pack-objects to repack promisor objects"));
-}
-
-struct pack_geometry {
-	struct packed_git **pack;
-	uint32_t pack_nr, pack_alloc;
-	uint32_t split;
-
-	int split_factor;
-};
-
-static uint32_t geometry_pack_weight(struct packed_git *p)
-{
-	if (open_pack_index(p))
-		die(_("cannot open index for %s"), p->pack_name);
-	return p->num_objects;
-}
-
-static int geometry_cmp(const void *va, const void *vb)
-{
-	uint32_t aw = geometry_pack_weight(*(struct packed_git **)va),
-		 bw = geometry_pack_weight(*(struct packed_git **)vb);
-
-	if (aw < bw)
-		return -1;
-	if (aw > bw)
-		return 1;
-	return 0;
-}
-
-static void init_pack_geometry(struct pack_geometry *geometry,
-			       struct string_list *existing_kept_packs,
-			       const struct pack_objects_args *args)
-{
-	struct packed_git *p;
-	struct strbuf buf = STRBUF_INIT;
-
-	for (p = get_all_packs(the_repository); p; p = p->next) {
-		if (args->local && !p->pack_local)
-			/*
-			 * When asked to only repack local packfiles we skip
-			 * over any packfiles that are borrowed from alternate
-			 * object directories.
-			 */
-			continue;
-
-		if (!pack_kept_objects) {
-			/*
-			 * Any pack that has its pack_keep bit set will appear
-			 * in existing_kept_packs below, but this saves us from
-			 * doing a more expensive check.
-			 */
-			if (p->pack_keep)
-				continue;
-
-			/*
-			 * The pack may be kept via the --keep-pack option;
-			 * check 'existing_kept_packs' to determine whether to
-			 * ignore it.
-			 */
-			strbuf_reset(&buf);
-			strbuf_addstr(&buf, pack_basename(p));
-			strbuf_strip_suffix(&buf, ".pack");
-
-			if (string_list_has_string(existing_kept_packs, buf.buf))
-				continue;
-		}
-		if (p->is_cruft)
-			continue;
-
-		ALLOC_GROW(geometry->pack,
-			   geometry->pack_nr + 1,
-			   geometry->pack_alloc);
-
-		geometry->pack[geometry->pack_nr] = p;
-		geometry->pack_nr++;
-	}
-
-	QSORT(geometry->pack, geometry->pack_nr, geometry_cmp);
-	strbuf_release(&buf);
-}
-
-static void split_pack_geometry(struct pack_geometry *geometry)
-{
-	uint32_t i;
-	uint32_t split;
-	off_t total_size = 0;
-
-	if (!geometry->pack_nr) {
-		geometry->split = geometry->pack_nr;
-		return;
-	}
-
-	/*
-	 * First, count the number of packs (in descending order of size) which
-	 * already form a geometric progression.
-	 */
-	for (i = geometry->pack_nr - 1; i > 0; i--) {
-		struct packed_git *ours = geometry->pack[i];
-		struct packed_git *prev = geometry->pack[i - 1];
-
-		if (unsigned_mult_overflows(geometry->split_factor,
-					    geometry_pack_weight(prev)))
-			die(_("pack %s too large to consider in geometric "
-			      "progression"),
-			    prev->pack_name);
-
-		if (geometry_pack_weight(ours) <
-		    geometry->split_factor * geometry_pack_weight(prev))
-			break;
-	}
-
-	split = i;
-
-	if (split) {
-		/*
-		 * Move the split one to the right, since the top element in the
-		 * last-compared pair can't be in the progression. Only do this
-		 * when we split in the middle of the array (otherwise if we got
-		 * to the end, then the split is in the right place).
-		 */
-		split++;
-	}
-
-	/*
-	 * Then, anything to the left of 'split' must be in a new pack. But,
-	 * creating that new pack may cause packs in the heavy half to no longer
-	 * form a geometric progression.
-	 *
-	 * Compute an expected size of the new pack, and then determine how many
-	 * packs in the heavy half need to be joined into it (if any) to restore
-	 * the geometric progression.
-	 */
-	for (i = 0; i < split; i++) {
-		struct packed_git *p = geometry->pack[i];
-
-		if (unsigned_add_overflows(total_size, geometry_pack_weight(p)))
-			die(_("pack %s too large to roll up"), p->pack_name);
-		total_size += geometry_pack_weight(p);
-	}
-	for (i = split; i < geometry->pack_nr; i++) {
-		struct packed_git *ours = geometry->pack[i];
-
-		if (unsigned_mult_overflows(geometry->split_factor,
-					    total_size))
-			die(_("pack %s too large to roll up"), ours->pack_name);
-
-		if (geometry_pack_weight(ours) <
-		    geometry->split_factor * total_size) {
-			if (unsigned_add_overflows(total_size,
-						   geometry_pack_weight(ours)))
-				die(_("pack %s too large to roll up"),
-				    ours->pack_name);
-
-			split++;
-			total_size += geometry_pack_weight(ours);
-		} else
-			break;
-	}
-
-	geometry->split = split;
-}
-
-static struct packed_git *get_preferred_pack(struct pack_geometry *geometry)
-{
-	uint32_t i;
-
-	if (!geometry) {
-		/*
-		 * No geometry means either an all-into-one repack (in which
-		 * case there is only one pack left and it is the largest) or an
-		 * incremental one.
-		 *
-		 * If repacking incrementally, then we could check the size of
-		 * all packs to determine which should be preferred, but leave
-		 * this for later.
-		 */
-		return NULL;
-	}
-	if (geometry->split == geometry->pack_nr)
-		return NULL;
-
-	/*
-	 * The preferred pack is the largest pack above the split line. In
-	 * other words, it is the largest pack that does not get rolled up in
-	 * the geometric repack.
-	 */
-	for (i = geometry->pack_nr; i > geometry->split; i--)
-		/*
-		 * A pack that is not local would never be included in a
-		 * multi-pack index. We thus skip over any non-local packs.
-		 */
-		if (geometry->pack[i - 1]->pack_local)
-			return geometry->pack[i - 1];
-
-	return NULL;
-}
-
-static void free_pack_geometry(struct pack_geometry *geometry)
-{
-	if (!geometry)
-		return;
-
-	free(geometry->pack);
-}
-
-struct midx_snapshot_ref_data {
-	struct tempfile *f;
-	struct oidset seen;
-	int preferred;
-};
-
-static int midx_snapshot_ref_one(const char *refname UNUSED,
-				 const struct object_id *oid,
-				 int flag UNUSED, void *_data)
-{
-	struct midx_snapshot_ref_data *data = _data;
-	struct object_id peeled;
-
-	if (!peel_iterated_oid(oid, &peeled))
-		oid = &peeled;
-
-	if (oidset_insert(&data->seen, oid))
-		return 0; /* already seen */
-
-	if (oid_object_info(the_repository, oid, NULL) != OBJ_COMMIT)
-		return 0;
-
-	fprintf(data->f->fp, "%s%s\n", data->preferred ? "+" : "",
-		oid_to_hex(oid));
-
-	return 0;
-}
-
-static void midx_snapshot_refs(struct tempfile *f)
-{
-	struct midx_snapshot_ref_data data;
-	const struct string_list *preferred = bitmap_preferred_tips(the_repository);
-
-	data.f = f;
-	data.preferred = 0;
-	oidset_init(&data.seen, 0);
-
-	if (!fdopen_tempfile(f, "w"))
-		 die(_("could not open tempfile %s for writing"),
-		     get_tempfile_path(f));
-
-	if (preferred) {
-		struct string_list_item *item;
-
-		data.preferred = 1;
-		for_each_string_list_item(item, preferred)
-			for_each_ref_in(item->string, midx_snapshot_ref_one, &data);
-		data.preferred = 0;
-	}
-
-	for_each_ref(midx_snapshot_ref_one, &data);
-
-	if (close_tempfile_gently(f)) {
-		int save_errno = errno;
-		delete_tempfile(&f);
-		errno = save_errno;
-		die_errno(_("could not close refs snapshot tempfile"));
-	}
-
-	oidset_clear(&data.seen);
-}
-
-static void midx_included_packs(struct string_list *include,
-				struct string_list *existing_nonkept_packs,
-				struct string_list *existing_kept_packs,
-				struct string_list *names,
-				struct pack_geometry *geometry)
-{
-	struct string_list_item *item;
-
-	for_each_string_list_item(item, existing_kept_packs)
-		string_list_insert(include, xstrfmt("%s.idx", item->string));
-	for_each_string_list_item(item, names)
-		string_list_insert(include, xstrfmt("pack-%s.idx", item->string));
-	if (geometry->split_factor) {
-		struct strbuf buf = STRBUF_INIT;
-		uint32_t i;
-		for (i = geometry->split; i < geometry->pack_nr; i++) {
-			struct packed_git *p = geometry->pack[i];
-
-			/*
-			 * The multi-pack index never refers to packfiles part
-			 * of an alternate object database, so we skip these.
-			 * While git-multi-pack-index(1) would silently ignore
-			 * them anyway, this allows us to skip executing the
-			 * command completely when we have only non-local
-			 * packfiles.
-			 */
-			if (!p->pack_local)
-				continue;
-
-			strbuf_addstr(&buf, pack_basename(p));
-			strbuf_strip_suffix(&buf, ".pack");
-			strbuf_addstr(&buf, ".idx");
-
-			string_list_insert(include, strbuf_detach(&buf, NULL));
-		}
-
-		for_each_string_list_item(item, existing_nonkept_packs) {
-			if (!((uintptr_t)item->util & CRUFT_PACK)) {
-				/*
-				 * no need to check DELETE_PACK, since we're not
-				 * doing an ALL_INTO_ONE repack
-				 */
-				continue;
-			}
-			string_list_insert(include, xstrfmt("%s.idx", item->string));
-		}
-	} else {
-		for_each_string_list_item(item, existing_nonkept_packs) {
-			if ((uintptr_t)item->util & DELETE_PACK)
-				continue;
-			string_list_insert(include, xstrfmt("%s.idx", item->string));
-		}
-	}
-}
-
-static int write_midx_included_packs(struct string_list *include,
-				     struct pack_geometry *geometry,
-				     const char *refs_snapshot,
-				     int show_progress, int write_bitmaps)
-{
-	struct child_process cmd = CHILD_PROCESS_INIT;
-	struct string_list_item *item;
-	struct packed_git *preferred = get_preferred_pack(geometry);
-	FILE *in;
-	int ret;
-
-	if (!include->nr)
-		return 0;
-
-	cmd.in = -1;
-	cmd.git_cmd = 1;
-
-	strvec_push(&cmd.args, "multi-pack-index");
-	strvec_pushl(&cmd.args, "write", "--stdin-packs", NULL);
-
-	if (show_progress)
-		strvec_push(&cmd.args, "--progress");
+	int *value = opt->value;
+
+	BUG_ON_OPT_ARG(arg);
+	if (unset)
+		*value = 0;
 	else
-		strvec_push(&cmd.args, "--no-progress");
+		*value = 1;
 
-	if (write_bitmaps)
-		strvec_push(&cmd.args, "--bitmap");
-
-	if (preferred)
-		strvec_pushf(&cmd.args, "--preferred-pack=%s",
-			     pack_basename(preferred));
-
-	if (refs_snapshot)
-		strvec_pushf(&cmd.args, "--refs-snapshot=%s", refs_snapshot);
-
-	ret = start_command(&cmd);
-	if (ret)
-		return ret;
-
-	in = xfdopen(cmd.in, "w");
-	for_each_string_list_item(item, include)
-		fprintf(in, "%s\n", item->string);
-	fclose(in);
-
-	return finish_command(&cmd);
+	write_bitmaps_given = 1;
+	return 0;
 }
 
-static void remove_redundant_bitmaps(struct string_list *include,
-				     const char *packdir)
+static int option_parse_write_midx(const struct option *opt, const char *arg,
+				   int unset)
 {
-	struct strbuf path = STRBUF_INIT;
-	struct string_list_item *item;
-	size_t packdir_len;
+	enum repack_write_midx_mode *cfg = opt->value;
 
-	strbuf_addstr(&path, packdir);
-	strbuf_addch(&path, '/');
-	packdir_len = path.len;
-
-	/*
-	 * Remove any pack bitmaps corresponding to packs which are now
-	 * included in the MIDX.
-	 */
-	for_each_string_list_item(item, include) {
-		strbuf_addstr(&path, item->string);
-		strbuf_strip_suffix(&path, ".idx");
-		strbuf_addstr(&path, ".bitmap");
-
-		if (unlink(path.buf) && errno != ENOENT)
-			warning_errno(_("could not remove stale bitmap: %s"),
-				      path.buf);
-
-		strbuf_setlen(&path, packdir_len);
+	if (unset) {
+		*cfg = REPACK_WRITE_MIDX_NONE;
+		return 0;
 	}
-	strbuf_release(&path);
+
+	if (!arg || !*arg)
+		*cfg = REPACK_WRITE_MIDX_DEFAULT;
+	else if (!strcmp(arg, "incremental"))
+		*cfg = REPACK_WRITE_MIDX_INCREMENTAL;
+	else
+		return error(_("unknown value for %s: %s"), opt->long_name, arg);
+
+	return 0;
 }
 
-static int write_cruft_pack(const struct pack_objects_args *args,
-			    const char *destination,
-			    const char *pack_prefix,
-			    const char *cruft_expiration,
-			    struct string_list *names,
-			    struct string_list *existing_packs,
-			    struct string_list *existing_kept_packs)
-{
-	struct child_process cmd = CHILD_PROCESS_INIT;
-	struct strbuf line = STRBUF_INIT;
-	struct string_list_item *item;
-	FILE *in, *out;
-	int ret;
-	const char *scratch;
-	int local = skip_prefix(destination, packdir, &scratch);
-
-	prepare_pack_objects(&cmd, args, destination);
-
-	strvec_push(&cmd.args, "--cruft");
-	if (cruft_expiration)
-		strvec_pushf(&cmd.args, "--cruft-expiration=%s",
-			     cruft_expiration);
-
-	strvec_push(&cmd.args, "--honor-pack-keep");
-	strvec_push(&cmd.args, "--non-empty");
-	strvec_push(&cmd.args, "--max-pack-size=0");
-
-	cmd.in = -1;
-
-	ret = start_command(&cmd);
-	if (ret)
-		return ret;
-
-	/*
-	 * names has a confusing double use: it both provides the list
-	 * of just-written new packs, and accepts the name of the cruft
-	 * pack we are writing.
-	 *
-	 * By the time it is read here, it contains only the pack(s)
-	 * that were just written, which is exactly the set of packs we
-	 * want to consider kept.
-	 *
-	 * If `--expire-to` is given, the double-use served by `names`
-	 * ensures that the pack written to `--expire-to` excludes any
-	 * objects contained in the cruft pack.
-	 */
-	in = xfdopen(cmd.in, "w");
-	for_each_string_list_item(item, names)
-		fprintf(in, "%s-%s.pack\n", pack_prefix, item->string);
-	for_each_string_list_item(item, existing_packs)
-		fprintf(in, "-%s.pack\n", item->string);
-	for_each_string_list_item(item, existing_kept_packs)
-		fprintf(in, "%s.pack\n", item->string);
-	fclose(in);
-
-	out = xfdopen(cmd.out, "r");
-	while (strbuf_getline_lf(&line, out) != EOF) {
-		struct string_list_item *item;
-
-		if (line.len != the_hash_algo->hexsz)
-			die(_("repack: Expecting full hex object ID lines only "
-			      "from pack-objects."));
-		/*
-		 * avoid putting packs written outside of the repository in the
-		 * list of names
-		 */
-		if (local) {
-			item = string_list_append(names, line.buf);
-			item->util = populate_pack_exts(line.buf);
-		}
-	}
-	fclose(out);
-
-	strbuf_release(&line);
-
-	return finish_command(&cmd);
-}
-
-int cmd_repack(int argc, const char **argv, const char *prefix)
+int cmd_repack(int argc,
+	       const char **argv,
+	       const char *prefix,
+	       struct repository *repo)
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	struct string_list_item *item;
 	struct string_list names = STRING_LIST_INIT_DUP;
-	struct string_list existing_nonkept_packs = STRING_LIST_INIT_DUP;
-	struct string_list existing_kept_packs = STRING_LIST_INIT_DUP;
+	struct existing_packs existing = EXISTING_PACKS_INIT;
+	struct oidset drop_oids = OIDSET_INIT;
 	struct pack_geometry geometry = { 0 };
-	struct strbuf line = STRBUF_INIT;
 	struct tempfile *refs_snapshot = NULL;
-	int i, ext, ret;
-	FILE *out;
+	int i, ret;
 	int show_progress;
 
 	/* variables to be filled by option parsing */
+	struct repack_config_ctx config_ctx;
 	int delete_redundant = 0;
 	const char *unpack_unreachable = NULL;
 	int keep_unreachable = 0;
 	struct string_list keep_pack_list = STRING_LIST_INIT_NODUP;
-	struct pack_objects_args po_args = {NULL};
-	struct pack_objects_args cruft_po_args = {NULL};
-	int write_midx = 0;
+	struct pack_objects_args po_args = PACK_OBJECTS_ARGS_INIT;
+	struct pack_objects_args cruft_po_args = PACK_OBJECTS_ARGS_INIT;
+	enum repack_write_midx_mode write_midx = REPACK_WRITE_MIDX_NONE;
 	const char *cruft_expiration = NULL;
 	const char *expire_to = NULL;
+	const char *filter_to = NULL;
+	const char *opt_window = NULL;
+	const char *opt_window_memory = NULL;
+	const char *opt_depth = NULL;
+	const char *opt_threads = NULL;
+	unsigned long combine_cruft_below_size = 0ul;
 
 	struct option builtin_repack_options[] = {
 		OPT_BIT('a', NULL, &pack_everything,
@@ -809,85 +199,232 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 				   PACK_CRUFT),
 		OPT_STRING(0, "cruft-expiration", &cruft_expiration, N_("approxidate"),
 				N_("with --cruft, expire objects older than this")),
+		OPT_UNSIGNED(0, "combine-cruft-below-size",
+			     &combine_cruft_below_size,
+			     N_("with --cruft, only repack cruft packs smaller than this")),
+		OPT_UNSIGNED(0, "max-cruft-size", &cruft_po_args.max_pack_size,
+			     N_("with --cruft, limit the size of new cruft packs")),
 		OPT_BOOL('d', NULL, &delete_redundant,
 				N_("remove redundant packs, and run git-prune-packed")),
 		OPT_BOOL('f', NULL, &po_args.no_reuse_delta,
 				N_("pass --no-reuse-delta to git-pack-objects")),
 		OPT_BOOL('F', NULL, &po_args.no_reuse_object,
 				N_("pass --no-reuse-object to git-pack-objects")),
+		OPT_INTEGER(0, "name-hash-version", &po_args.name_hash_version,
+				N_("specify the name hash version to use for grouping similar objects by path")),
+		OPT_BOOL(0, "path-walk", &po_args.path_walk,
+				N_("pass --path-walk to git-pack-objects")),
 		OPT_NEGBIT('n', NULL, &run_update_server_info,
 				N_("do not run git-update-server-info"), 1),
 		OPT__QUIET(&po_args.quiet, N_("be quiet")),
 		OPT_BOOL('l', "local", &po_args.local,
 				N_("pass --local to git-pack-objects")),
-		OPT_BOOL('b', "write-bitmap-index", &write_bitmaps,
-				N_("write bitmap index")),
+		OPT_CALLBACK_F('b', "write-bitmap-index", &write_bitmaps, NULL,
+				N_("write bitmap index"),
+				PARSE_OPT_NOARG, option_parse_write_bitmaps),
 		OPT_BOOL('i', "delta-islands", &use_delta_islands,
 				N_("pass --delta-islands to git-pack-objects")),
 		OPT_STRING(0, "unpack-unreachable", &unpack_unreachable, N_("approxidate"),
 				N_("with -A, do not loosen objects older than this")),
 		OPT_BOOL('k', "keep-unreachable", &keep_unreachable,
 				N_("with -a, repack unreachable objects")),
-		OPT_STRING(0, "window", &po_args.window, N_("n"),
+		OPT_STRING(0, "window", &opt_window, N_("n"),
 				N_("size of the window used for delta compression")),
-		OPT_STRING(0, "window-memory", &po_args.window_memory, N_("bytes"),
+		OPT_STRING(0, "window-memory", &opt_window_memory, N_("bytes"),
 				N_("same as the above, but limit memory size instead of entries count")),
-		OPT_STRING(0, "depth", &po_args.depth, N_("n"),
+		OPT_STRING(0, "depth", &opt_depth, N_("n"),
 				N_("limits the maximum delta depth")),
-		OPT_STRING(0, "threads", &po_args.threads, N_("n"),
+		OPT_STRING(0, "threads", &opt_threads, N_("n"),
 				N_("limits the maximum number of threads")),
-		OPT_STRING(0, "max-pack-size", &po_args.max_pack_size, N_("bytes"),
-				N_("maximum size of each packfile")),
-		OPT_BOOL(0, "pack-kept-objects", &pack_kept_objects,
+		OPT_UNSIGNED(0, "max-pack-size", &po_args.max_pack_size,
+			     N_("maximum size of each packfile")),
+		OPT_PARSE_LIST_OBJECTS_FILTER(&po_args.filter_options),
+		OPT_BOOL(0, "pack-kept-objects", &po_args.pack_kept_objects,
 				N_("repack objects in packs marked with .keep")),
 		OPT_STRING_LIST(0, "keep-pack", &keep_pack_list, N_("name"),
 				N_("do not repack this pack")),
 		OPT_INTEGER('g', "geometric", &geometry.split_factor,
 			    N_("find a geometric progression with factor <N>")),
-		OPT_BOOL('m', "write-midx", &write_midx,
-			   N_("write a multi-pack index of the resulting packs")),
+		OPT_CALLBACK_F(0, "write-midx", &write_midx,
+			   N_("mode"),
+			   N_("write a multi-pack index of the resulting packs"),
+			   PARSE_OPT_OPTARG, option_parse_write_midx),
+		OPT_SET_INT_F('m', NULL, &write_midx,
+			   N_("write a multi-pack index of the resulting packs"),
+			   REPACK_WRITE_MIDX_DEFAULT,
+			   PARSE_OPT_HIDDEN),
 		OPT_STRING(0, "expire-to", &expire_to, N_("dir"),
 			   N_("pack prefix to store a pack containing pruned objects")),
+		OPT_STRING(0, "filter-to", &filter_to, N_("dir"),
+			   N_("pack prefix to store a pack containing filtered out objects")),
+		OPT_BOOL(0, "drop-filtered", &drop_filtered,
+				N_("delete filtered out objects (requires --filter)")),
+		OPT_BOOL(0, "dry-run", &dry_run,
+				N_("only show which objects would be dropped")),
 		OPT_END()
 	};
 
-	git_config(repack_config, &cruft_po_args);
+	list_objects_filter_init(&po_args.filter_options);
+
+	memset(&config_ctx, 0, sizeof(config_ctx));
+	config_ctx.po_args = &po_args;
+	config_ctx.cruft_po_args = &cruft_po_args;
+	config_ctx.midx_split_factor = DEFAULT_MIDX_SPLIT_FACTOR;
+	config_ctx.midx_new_layer_threshold = DEFAULT_MIDX_NEW_LAYER_THRESHOLD;
+
+	repo_config(repo, repack_config, &config_ctx);
 
 	argc = parse_options(argc, argv, prefix, builtin_repack_options,
 				git_repack_usage, 0);
 
-	if (delete_redundant && repository_format_precious_objects)
+	po_args.window = xstrdup_or_null(opt_window);
+	po_args.window_memory = xstrdup_or_null(opt_window_memory);
+	po_args.depth = xstrdup_or_null(opt_depth);
+	po_args.threads = xstrdup_or_null(opt_threads);
+
+	die_for_incompatible_opt2(drop_filtered, "--drop-filtered",
+		!!filter_to, "--filter-to");
+
+	if (dry_run && !drop_filtered)
+		die(_("--dry-run only takes effect with --drop-filtered"));
+
+	if (drop_filtered) {
+		if (!po_args.filter_options.choice)
+			die(_("--drop-filtered requires --filter"));
+
+		if (!(pack_everything & ALL_INTO_ONE))
+			die(_("--drop-filtered requires -a"));
+
+		/*
+		 * Only blob:limit=<n> is supported for now. Reject other
+		 * filter choices early, before walking the object database.
+		 */
+		if (po_args.filter_options.choice != LOFC_BLOB_LIMIT)
+			die(_("--drop-filtered only supports --filter=blob:limit=<n> for now"));
+
+		/*
+		 * An explicit -b on the command line is a conflict we have to
+		 * report; a bitmap setting from config is silently overridden
+		 * for the duration of the command.
+		 */
+		if (write_bitmaps_given && write_bitmaps > 0)
+			die(_("options '%s' and '%s' cannot be used together"),
+				"--drop-filtered", "--write-bitmap-index");
+
+		/*
+		 * Without a promisor remote there is nowhere to re-fetch the
+		 * dropped objects from, so dropping them would be permanent
+		 * data loss.
+		 */
+		if (!repo_has_promisor_remote(repo))
+			die(_("--drop-filtered requires a promisor remote"));
+
+		/*
+		 * Refuse to run while another operation is in progress. A
+		 * dropped object would just be lazily re-fetched when the
+		 * operation resumes, but triggering a network fetch in the
+		 * middle of a half-finished
+		 * merge/rebase/cherry-pick/revert/bisect is a poor
+		 * experience, so this is a UX convenience rather than a
+		 * safety measure. Bare repositories have no such state, so
+		 * the check is skipped there.
+		 */
+		if (!is_bare_repository(repo)) {
+			struct wt_status_state state = { 0 };
+
+			wt_status_get_state(repo, &state, 0);
+			if (state.merge_in_progress || state.revert_in_progress ||
+			    state.rebase_in_progress || state.bisect_in_progress ||
+			    state.cherry_pick_in_progress || state.am_in_progress ||
+			    state.rebase_interactive_in_progress) {
+				wt_status_state_free_buffers(&state);
+				die(_("--drop-filtered cannot be used while "
+				      "another operation (merge, rebase, am, "
+				      "cherry-pick, revert, or bisect) is in "
+				      "progress"));
+			}
+			wt_status_state_free_buffers(&state);
+		}
+
+		write_bitmaps = 0;
+
+		/*
+		 * Dropping objects means rebuilding the promisor packs
+		 * without them and then removing the old packs, so the
+		 * redundant packs must be deleted. Imply -d.
+		 */
+		delete_redundant = 1;
+
+		ret = enumerate_promisor_blobs(repo, &po_args.filter_options, &drop_oids);
+
+		if (ret)
+			goto cleanup;
+
+		/*
+		 * Refuse to drop blobs that the current index references.
+		 * Such a blob would only be lazily re-fetched by the next
+		 * command that touches the worktree, so dropping it reclaims
+		 * nothing. This guard just avoids that churn. Bare
+		 * repositories have no index, so the check is skipped there.
+		 */
+		if (!is_bare_repository(repo) && oidset_size(&drop_oids)) {
+			struct index_state *istate = repo->index;
+			unsigned int i;
+
+			if (repo_read_index(repo) < 0)
+				die(_("could not read the index"));
+
+			for (i = 0; i < istate->cache_nr; i++) {
+				const struct cache_entry *ce = istate->cache[i];
+
+				if (oidset_contains(&drop_oids, &ce->oid))
+					die(_("cannot drop '%s' (%s): it is referenced by the current index"),
+						ce->name, oid_to_hex(&ce->oid));
+			}
+		}
+
+		if (dry_run) {
+			struct oidset_iter iter;
+			const struct object_id *oid;
+
+			oidset_iter_init(&drop_oids, &iter);
+			while ((oid = oidset_iter_next(&iter)))
+				printf("%s\n", oid_to_hex(oid));
+
+			/*
+			 * Only list the candidates to be dropped; skip
+			 * the actual repack
+			 */
+			ret = 0;
+			goto cleanup;
+		}
+	}
+
+	if (delete_redundant && repo->repository_format_precious_objects)
 		die(_("cannot delete packs in a precious-objects repo"));
 
-	if (keep_unreachable &&
-	    (unpack_unreachable || (pack_everything & LOOSEN_UNREACHABLE)))
-		die(_("options '%s' and '%s' cannot be used together"), "--keep-unreachable", "-A");
+	die_for_incompatible_opt3(unpack_unreachable || (pack_everything & LOOSEN_UNREACHABLE), "-A",
+				  keep_unreachable, "-k/--keep-unreachable",
+				  pack_everything & PACK_CRUFT, "--cruft");
 
-	if (pack_everything & PACK_CRUFT) {
+	if (pack_everything & PACK_CRUFT)
 		pack_everything |= ALL_INTO_ONE;
 
-		if (unpack_unreachable || (pack_everything & LOOSEN_UNREACHABLE))
-			die(_("options '%s' and '%s' cannot be used together"), "--cruft", "-A");
-		if (keep_unreachable)
-			die(_("options '%s' and '%s' cannot be used together"), "--cruft", "-k");
-	}
-
 	if (write_bitmaps < 0) {
-		if (!write_midx &&
-		    (!(pack_everything & ALL_INTO_ONE) || !is_bare_repository()))
+		if (write_midx == REPACK_WRITE_MIDX_NONE &&
+		    (!(pack_everything & ALL_INTO_ONE) || !is_bare_repository(repo)))
 			write_bitmaps = 0;
-	} else if (write_bitmaps &&
-		   git_env_bool(GIT_TEST_MULTI_PACK_INDEX, 0) &&
-		   git_env_bool(GIT_TEST_MULTI_PACK_INDEX_WRITE_BITMAP, 0)) {
-		write_bitmaps = 0;
 	}
-	if (pack_kept_objects < 0)
-		pack_kept_objects = write_bitmaps > 0 && !write_midx;
+	if (po_args.pack_kept_objects < 0)
+		po_args.pack_kept_objects = write_bitmaps > 0 &&
+			write_midx == REPACK_WRITE_MIDX_NONE;
 
-	if (write_bitmaps && !(pack_everything & ALL_INTO_ONE) && !write_midx)
+	if (write_bitmaps && !(pack_everything & ALL_INTO_ONE) &&
+	    write_midx == REPACK_WRITE_MIDX_NONE)
 		die(_(incremental_bitmap_conflict_error));
 
-	if (write_bitmaps && po_args.local && has_alt_odb(the_repository)) {
+	if (write_bitmaps && po_args.local &&
+	    odb_has_alternates(repo->objects)) {
 		/*
 		 * When asked to do a local repack, but we have
 		 * packfiles that are inherited from an alternate, then
@@ -899,30 +436,42 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 		write_bitmaps = 0;
 	}
 
-	if (write_midx && write_bitmaps) {
+	if (config_ctx.midx_split_factor < 2)
+		die(_("invalid value for %s: %d"), "--midx-split-factor",
+		    config_ctx.midx_split_factor);
+	if (config_ctx.midx_new_layer_threshold < 1)
+		die(_("invalid value for %s: %d"), "--midx-new-layer-threshold",
+		    config_ctx.midx_new_layer_threshold);
+
+	if (write_midx != REPACK_WRITE_MIDX_NONE && write_bitmaps) {
 		struct strbuf path = STRBUF_INIT;
 
-		strbuf_addf(&path, "%s/%s_XXXXXX", get_object_directory(),
+		strbuf_addf(&path, "%s/%s_XXXXXX",
+			    repo_get_object_directory(repo),
 			    "bitmap-ref-tips");
 
 		refs_snapshot = xmks_tempfile(path.buf);
-		midx_snapshot_refs(refs_snapshot);
+		midx_snapshot_refs(repo, refs_snapshot);
 
 		strbuf_release(&path);
 	}
 
-	packdir = mkpathdup("%s/pack", get_object_directory());
+	packdir = mkpathdup("%s/pack", repo_get_object_directory(repo));
 	packtmp_name = xstrfmt(".tmp-%d-pack", (int)getpid());
 	packtmp = mkpathdup("%s/%s", packdir, packtmp_name);
 
-	collect_pack_filenames(&existing_nonkept_packs, &existing_kept_packs,
-			       &keep_pack_list);
+	existing.repo = repo;
+	existing_packs_collect(&existing, &keep_pack_list);
 
 	if (geometry.split_factor) {
 		if (pack_everything)
 			die(_("options '%s' and '%s' cannot be used together"), "--geometric", "-A/-a");
-		init_pack_geometry(&geometry, &existing_kept_packs, &po_args);
-		split_pack_geometry(&geometry);
+		if (write_midx == REPACK_WRITE_MIDX_INCREMENTAL) {
+			geometry.midx_layer_threshold = config_ctx.midx_new_layer_threshold;
+			geometry.midx_layer_threshold_set = true;
+		}
+		pack_geometry_init(&geometry, &existing, &po_args);
+		pack_geometry_split(&geometry);
 	}
 
 	prepare_pack_objects(&cmd, &po_args, packtmp);
@@ -930,8 +479,6 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 	show_progress = !po_args.quiet && isatty(2);
 
 	strvec_push(&cmd.args, "--keep-true-parents");
-	if (!pack_kept_objects)
-		strvec_push(&cmd.args, "--honor-pack-keep");
 	for (i = 0; i < keep_pack_list.nr; i++)
 		strvec_pushf(&cmd.args, "--keep-pack=%s",
 			     keep_pack_list.items[i].string);
@@ -951,9 +498,9 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 		strvec_push(&cmd.args, "--reflog");
 		strvec_push(&cmd.args, "--indexed-objects");
 	}
-	if (repo_has_promisor_remote(the_repository))
+	if (repo_has_promisor_remote(repo))
 		strvec_push(&cmd.args, "--exclude-promisor-objects");
-	if (!write_midx) {
+	if (write_midx == REPACK_WRITE_MIDX_NONE) {
 		if (write_bitmaps > 0)
 			strvec_push(&cmd.args, "--write-bitmap-index");
 		else if (write_bitmaps < 0)
@@ -963,9 +510,11 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 		strvec_push(&cmd.args, "--delta-islands");
 
 	if (pack_everything & ALL_INTO_ONE) {
-		repack_promisor_objects(&po_args, &names);
+		repack_promisor_objects(repo, &po_args, &names, packtmp,
+			drop_filtered ? &drop_oids : NULL);
 
-		if (existing_nonkept_packs.nr && delete_redundant &&
+		if (existing_packs_has_non_kept(&existing) &&
+		    delete_redundant &&
 		    !(pack_everything & PACK_CRUFT)) {
 			for_each_string_list_item(item, &names) {
 				strvec_pushf(&cmd.args, "--keep-pack=%s-%s.pack",
@@ -980,16 +529,31 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 					    "--unpack-unreachable");
 			} else if (keep_unreachable) {
 				strvec_push(&cmd.args, "--keep-unreachable");
-				strvec_push(&cmd.args, "--pack-loose-unreachable");
 			}
 		}
+
+		if (keep_unreachable && delete_redundant &&
+		    !(pack_everything & PACK_CRUFT))
+			strvec_push(&cmd.args, "--pack-loose-unreachable");
 	} else if (geometry.split_factor) {
-		strvec_push(&cmd.args, "--stdin-packs");
+		pack_geometry_repack_promisors(repo, &po_args, &geometry,
+					       &names, packtmp);
+
+		if (midx_must_contain_cruft)
+			strvec_push(&cmd.args, "--stdin-packs");
+		else
+			strvec_push(&cmd.args, "--stdin-packs=follow");
 		strvec_push(&cmd.args, "--unpacked");
 	} else {
 		strvec_push(&cmd.args, "--unpacked");
 		strvec_push(&cmd.args, "--incremental");
 	}
+
+	if (po_args.filter_options.choice)
+		strvec_pushf(&cmd.args, "--filter=%s",
+			     expand_list_objects_filter_spec(&po_args.filter_options));
+	else if (filter_to)
+		die(_("option '%s' can only be used along with '%s'"), "--filter-to", "--filter");
 
 	if (geometry.split_factor)
 		cmd.in = -1;
@@ -1009,53 +573,87 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 		 */
 		for (i = 0; i < geometry.split; i++)
 			fprintf(in, "%s\n", pack_basename(geometry.pack[i]));
-		for (i = geometry.split; i < geometry.pack_nr; i++)
-			fprintf(in, "^%s\n", pack_basename(geometry.pack[i]));
+		for (i = geometry.split; i < geometry.pack_nr; i++) {
+			const char *basename = pack_basename(geometry.pack[i]);
+			char marker = '^';
+
+			if (!midx_must_contain_cruft &&
+			    !string_list_has_string(&existing.midx_packs,
+						    basename)) {
+				/*
+				 * Assume non-MIDX'd packs are not
+				 * necessarily closed under
+				 * reachability.
+				 */
+				marker = '!';
+			}
+
+			fprintf(in, "%c%s\n", marker, basename);
+		}
 		fclose(in);
 	}
 
-	out = xfdopen(cmd.out, "r");
-	while (strbuf_getline_lf(&line, out) != EOF) {
-		struct string_list_item *item;
-
-		if (line.len != the_hash_algo->hexsz)
-			die(_("repack: Expecting full hex object ID lines only from pack-objects."));
-		item = string_list_append(&names, line.buf);
-		item->util = populate_pack_exts(item->string);
+	{
+		struct write_pack_opts opts = {
+			.packdir = packdir,
+			.destination = packdir,
+			.packtmp = packtmp,
+		};
+		ret = finish_pack_objects_cmd(repo->hash_algo, &opts, &cmd,
+					      &names);
+		if (ret)
+			goto cleanup;
 	}
-	strbuf_release(&line);
-	fclose(out);
-	ret = finish_command(&cmd);
-	if (ret)
-		goto cleanup;
 
-	if (!names.nr && !po_args.quiet)
-		printf_ln(_("Nothing new to pack."));
+	if (!names.nr) {
+		struct odb_source_files *files = odb_source_files_downcast(existing.source);
+
+		if (!po_args.quiet)
+			printf_ln(_("Nothing new to pack."));
+		/*
+		 * If we didn't write any new packs, the non-cruft packs
+		 * may refer to once-unreachable objects in the cruft
+		 * pack(s).
+		 *
+		 * If there isn't already a MIDX, the one we write
+		 * must include the cruft pack(s), in case the
+		 * non-cruft pack(s) refer to once-cruft objects.
+		 *
+		 * If there is already a MIDX, we can punt here, since
+		 * midx_has_unknown_packs() will make the decision for
+		 * us.
+		 */
+		if (!get_multi_pack_index(files->dirs->packed))
+			midx_must_contain_cruft = 1;
+	}
 
 	if (pack_everything & PACK_CRUFT) {
-		const char *pack_prefix;
-		if (!skip_prefix(packtmp, packdir, &pack_prefix))
-			die(_("pack prefix %s does not begin with objdir %s"),
-			    packtmp, packdir);
-		if (*pack_prefix == '/')
-			pack_prefix++;
+		struct write_pack_opts opts = {
+			.po_args = &cruft_po_args,
+			.destination = packtmp,
+			.packtmp = packtmp,
+			.packdir = packdir,
+		};
 
 		if (!cruft_po_args.window)
-			cruft_po_args.window = po_args.window;
+			cruft_po_args.window = xstrdup_or_null(po_args.window);
 		if (!cruft_po_args.window_memory)
-			cruft_po_args.window_memory = po_args.window_memory;
+			cruft_po_args.window_memory = xstrdup_or_null(po_args.window_memory);
 		if (!cruft_po_args.depth)
-			cruft_po_args.depth = po_args.depth;
+			cruft_po_args.depth = xstrdup_or_null(po_args.depth);
 		if (!cruft_po_args.threads)
-			cruft_po_args.threads = po_args.threads;
+			cruft_po_args.threads = xstrdup_or_null(po_args.threads);
+		if (!cruft_po_args.max_pack_size)
+			cruft_po_args.max_pack_size = po_args.max_pack_size;
 
 		cruft_po_args.local = po_args.local;
 		cruft_po_args.quiet = po_args.quiet;
+		cruft_po_args.delta_base_offset = po_args.delta_base_offset;
+		cruft_po_args.pack_kept_objects = 0;
 
-		ret = write_cruft_pack(&cruft_po_args, packtmp, pack_prefix,
-				       cruft_expiration, &names,
-				       &existing_nonkept_packs,
-				       &existing_kept_packs);
+		ret = write_cruft_pack(&opts, cruft_expiration,
+				       combine_cruft_below_size, &names,
+				       &existing);
 		if (ret)
 			goto cleanup;
 
@@ -1081,152 +679,119 @@ int cmd_repack(int argc, const char **argv, const char *prefix)
 			 * generate an empty pack (since every object not in the
 			 * cruft pack generated above will have an mtime older
 			 * than the expiration).
+			 *
+			 * Pretend we don't have a `--combine-cruft-below-size`
+			 * argument, since we're not selectively combining
+			 * anything based on size to generate the limbo cruft
+			 * pack, but rather removing all cruft packs from the
+			 * main repository regardless of size.
 			 */
-			ret = write_cruft_pack(&cruft_po_args, expire_to,
-					       pack_prefix,
-					       NULL,
-					       &names,
-					       &existing_nonkept_packs,
-					       &existing_kept_packs);
+			opts.destination = expire_to;
+			ret = write_cruft_pack(&opts, NULL, 0ul, &names,
+					       &existing);
 			if (ret)
 				goto cleanup;
 		}
 	}
 
-	string_list_sort(&names);
+	if (po_args.filter_options.choice && !drop_filtered) {
+		struct write_pack_opts opts = {
+			.po_args = &po_args,
+			.destination = filter_to,
+			.packdir = packdir,
+			.packtmp = packtmp,
+		};
 
-	close_object_store(the_repository->objects);
+		if (!opts.destination)
+			opts.destination = packtmp;
 
-	/*
-	 * Ok we have prepared all new packfiles.
-	 */
-	for_each_string_list_item(item, &names) {
-		struct generated_pack_data *data = item->util;
-
-		for (ext = 0; ext < ARRAY_SIZE(exts); ext++) {
-			char *fname;
-
-			fname = mkpathdup("%s/pack-%s%s",
-					packdir, item->string, exts[ext].name);
-
-			if (data->tempfiles[ext]) {
-				const char *fname_old = get_tempfile_path(data->tempfiles[ext]);
-				struct stat statbuffer;
-
-				if (!stat(fname_old, &statbuffer)) {
-					statbuffer.st_mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
-					chmod(fname_old, statbuffer.st_mode);
-				}
-
-				if (rename_tempfile(&data->tempfiles[ext], fname))
-					die_errno(_("renaming pack to '%s' failed"), fname);
-			} else if (!exts[ext].optional)
-				die(_("pack-objects did not write a '%s' file for pack %s-%s"),
-				    exts[ext].name, packtmp, item->string);
-			else if (unlink(fname) < 0 && errno != ENOENT)
-				die_errno(_("could not unlink: %s"), fname);
-
-			free(fname);
-		}
-	}
-	/* End of pack replacement. */
-
-	if (delete_redundant && pack_everything & ALL_INTO_ONE) {
-		const int hexsz = the_hash_algo->hexsz;
-		for_each_string_list_item(item, &existing_nonkept_packs) {
-			char *sha1;
-			size_t len = strlen(item->string);
-			if (len < hexsz)
-				continue;
-			sha1 = item->string + len - hexsz;
-			/*
-			 * Mark this pack for deletion, which ensures that this
-			 * pack won't be included in a MIDX (if `--write-midx`
-			 * was given) and that we will actually delete this pack
-			 * (if `-d` was given).
-			 */
-			if (!string_list_has_string(&names, sha1))
-				item->util = (void*)(uintptr_t)((size_t)item->util | DELETE_PACK);
-		}
-	}
-
-	if (write_midx) {
-		struct string_list include = STRING_LIST_INIT_NODUP;
-		midx_included_packs(&include, &existing_nonkept_packs,
-				    &existing_kept_packs, &names, &geometry);
-
-		ret = write_midx_included_packs(&include, &geometry,
-						refs_snapshot ? get_tempfile_path(refs_snapshot) : NULL,
-						show_progress, write_bitmaps > 0);
-
-		if (!ret && write_bitmaps)
-			remove_redundant_bitmaps(&include, packdir);
-
-		string_list_clear(&include, 0);
-
+		ret = write_filtered_pack(&opts, &existing, &names);
 		if (ret)
 			goto cleanup;
 	}
 
-	reprepare_packed_git(the_repository);
+	string_list_sort(&names);
+
+	odb_close(repo->objects);
+
+	/*
+	 * Ok we have prepared all new packfiles.
+	 */
+	for_each_string_list_item(item, &names)
+		generated_pack_install(item->util, item->string, packdir,
+				       packtmp);
+	/* End of pack replacement. */
+
+	if (delete_redundant && pack_everything & ALL_INTO_ONE) {
+		if (write_midx == REPACK_WRITE_MIDX_INCREMENTAL)
+			existing_packs_retain_midx_packs(&existing);
+		existing_packs_mark_for_deletion(&existing, &names);
+	}
+
+	if (write_midx != REPACK_WRITE_MIDX_NONE) {
+		struct repack_write_midx_opts opts = {
+			.existing = &existing,
+			.geometry = &geometry,
+			.names = &names,
+			.refs_snapshot = refs_snapshot ? get_tempfile_path(refs_snapshot) : NULL,
+			.packdir = packdir,
+			.show_progress = show_progress,
+			.write_bitmaps = write_bitmaps > 0,
+			.midx_must_contain_cruft = midx_must_contain_cruft,
+			.midx_split_factor = config_ctx.midx_split_factor,
+			.midx_new_layer_threshold = config_ctx.midx_new_layer_threshold,
+			.mode = write_midx,
+		};
+
+		ret = repack_write_midx(&opts);
+		if (ret)
+			goto cleanup;
+	}
+
+	odb_reprepare(repo->objects);
 
 	if (delete_redundant) {
 		int opts = 0;
-		for_each_string_list_item(item, &existing_nonkept_packs) {
-			if (!((uintptr_t)item->util & DELETE_PACK))
-				continue;
-			remove_redundant_pack(packdir, item->string);
-		}
+		bool wrote_incremental_midx = write_midx == REPACK_WRITE_MIDX_INCREMENTAL;
 
-		if (geometry.split_factor) {
-			struct strbuf buf = STRBUF_INIT;
+		existing_packs_remove_redundant(&existing, packdir,
+						wrote_incremental_midx);
 
-			uint32_t i;
-			for (i = 0; i < geometry.split; i++) {
-				struct packed_git *p = geometry.pack[i];
-				if (string_list_has_string(&names,
-							   hash_to_hex(p->hash)))
-					continue;
-
-				strbuf_reset(&buf);
-				strbuf_addstr(&buf, pack_basename(p));
-				strbuf_strip_suffix(&buf, ".pack");
-
-				if ((p->pack_keep) ||
-				    (string_list_has_string(&existing_kept_packs,
-							    buf.buf)))
-					continue;
-
-				remove_redundant_pack(packdir, buf.buf);
-			}
-			strbuf_release(&buf);
-		}
+		if (geometry.split_factor)
+			pack_geometry_remove_redundant(&geometry, &names,
+						       &existing, packdir,
+						       wrote_incremental_midx);
 		if (show_progress)
 			opts |= PRUNE_PACKED_VERBOSE;
-		prune_packed_objects(opts);
+		prune_packed_objects(repo, opts);
 
 		if (!keep_unreachable &&
 		    (!(pack_everything & LOOSEN_UNREACHABLE) ||
 		     unpack_unreachable) &&
-		    is_repository_shallow(the_repository))
+		    is_repository_shallow(repo))
 			prune_shallow(PRUNE_QUICK);
 	}
 
 	if (run_update_server_info)
-		update_server_info(0);
+		update_server_info(repo, 0);
 
 	if (git_env_bool(GIT_TEST_MULTI_PACK_INDEX, 0)) {
+		struct odb_source_files *files = odb_source_files_downcast(existing.source);
 		unsigned flags = 0;
-		if (git_env_bool(GIT_TEST_MULTI_PACK_INDEX_WRITE_BITMAP, 0))
-			flags |= MIDX_WRITE_BITMAP | MIDX_WRITE_REV_INDEX;
-		write_midx_file(get_object_directory(), NULL, NULL, flags);
+
+		if (git_env_bool(GIT_TEST_MULTI_PACK_INDEX_WRITE_INCREMENTAL, 0))
+			flags |= MIDX_WRITE_INCREMENTAL;
+		write_midx_file(files->dirs->packed, NULL, NULL, flags);
 	}
 
 cleanup:
+	string_list_clear(&keep_pack_list, 0);
 	string_list_clear(&names, 1);
-	string_list_clear(&existing_nonkept_packs, 0);
-	string_list_clear(&existing_kept_packs, 0);
-	free_pack_geometry(&geometry);
+	oidset_clear(&drop_oids);
+	existing_packs_release(&existing);
+	pack_geometry_release(&geometry);
+	pack_objects_args_release(&po_args);
+	pack_objects_args_release(&cruft_po_args);
 
 	return ret;
 }

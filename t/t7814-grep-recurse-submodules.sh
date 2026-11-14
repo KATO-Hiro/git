@@ -9,9 +9,6 @@ submodules.
 TEST_CREATE_REPO_NO_TEMPLATE=1
 . ./test-lib.sh
 
-GIT_TEST_FATAL_REGISTER_SUBMODULE_ODB=1
-export GIT_TEST_FATAL_REGISTER_SUBMODULE_ODB
-
 test_expect_success 'setup directory structure and submodule' '
 	echo "(1|2)d(3|4)" >a &&
 	mkdir b &&
@@ -348,7 +345,7 @@ test_incompatible_with_recurse_submodules ()
 {
 	test_expect_success "--recurse-submodules and $1 are incompatible" "
 		test_must_fail git grep -e. --recurse-submodules $1 2>actual &&
-		test_i18ngrep 'not supported with --recurse-submodules' actual
+		test_grep 'not supported with --recurse-submodules' actual
 	"
 }
 
@@ -590,7 +587,7 @@ test_expect_success 'grep partially-cloned submodule' '
 			--recurse-submodules HEAD^ >actual &&
 		test_cmp expect actual &&
 		# Verify that we actually fetched data from the promisor remote:
-		grep \"category\":\"promisor\",\"key\":\"fetch_count\",\"value\":\"1\" trace2.log
+		test_grep \"category\":\"promisor\",\"key\":\"fetch_count\",\"value\":\"1\" trace2.log
 	)
 '
 

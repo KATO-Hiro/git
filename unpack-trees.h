@@ -7,7 +7,7 @@
 #include "string-list.h"
 #include "tree-walk.h"
 
-#define MAX_UNPACK_TREES MAX_TRAVERSE_TREES
+#define MAX_UNPACK_TREES 8
 
 struct cache_entry;
 struct unpack_trees_options;
@@ -122,9 +122,6 @@ enum update_sparsity_result {
 
 enum update_sparsity_result update_sparsity(struct unpack_trees_options *options,
 					    struct pattern_list *pl);
-
-int verify_uptodate(const struct cache_entry *ce,
-		    struct unpack_trees_options *o);
 
 int threeway_merge(const struct cache_entry * const *stages,
 		   struct unpack_trees_options *o);

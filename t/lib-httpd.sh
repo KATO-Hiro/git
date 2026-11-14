@@ -55,21 +55,31 @@ fi
 
 HTTPD_PARA=""
 
-for DEFAULT_HTTPD_PATH in '/usr/sbin/httpd' '/usr/sbin/apache2'
+for DEFAULT_HTTPD_PATH in '/usr/sbin/httpd' \
+			  '/usr/sbin/apache2' \
+			  "$(command -v httpd)" \
+			  "$(command -v apache2)"
 do
-	if test -x "$DEFAULT_HTTPD_PATH"
+	if test -n "$DEFAULT_HTTPD_PATH" && test -x "$DEFAULT_HTTPD_PATH"
 	then
 		break
 	fi
 done
 
+if test -x "$DEFAULT_HTTPD_PATH"
+then
+	DETECTED_HTTPD_ROOT="$("$DEFAULT_HTTPD_PATH" -V 2>/dev/null | sed -n 's/^ -D HTTPD_ROOT="\(.*\)"$/\1/p')"
+fi
+
 for DEFAULT_HTTPD_MODULE_PATH in '/usr/libexec/apache2' \
 				 '/usr/lib/apache2/modules' \
 				 '/usr/lib64/httpd/modules' \
 				 '/usr/lib/httpd/modules' \
-				 '/usr/libexec/httpd'
+				 '/usr/libexec/httpd' \
+				 '/usr/lib/apache2' \
+				 "${DETECTED_HTTPD_ROOT:+${DETECTED_HTTPD_ROOT}/modules}"
 do
-	if test -d "$DEFAULT_HTTPD_MODULE_PATH"
+	if test -n "$DEFAULT_HTTPD_MODULE_PATH" && test -d "$DEFAULT_HTTPD_MODULE_PATH"
 	then
 		break
 	fi
@@ -127,6 +137,20 @@ else
 		"Could not identify web server at '$LIB_HTTPD_PATH'"
 fi
 
+if test -n "$LIB_HTTPD_DAV" && test -f /etc/os-release
+then
+	case "$(grep "^ID=" /etc/os-release | cut -d= -f2-)" in
+	alpine)
+		# The WebDAV module in Alpine Linux is broken at least up to
+		# Alpine v3.16 as the default DBM driver is missing.
+		#
+		# https://gitlab.alpinelinux.org/alpine/aports/-/issues/13112
+		test_skip_or_die GIT_TEST_HTTPD \
+			"Apache WebDAV module does not have default DBM backend driver"
+		;;
+	esac
+fi
+
 install_script () {
 	write_script "$HTTPD_ROOT_PATH/$1" <"$TEST_PATH/$1"
 }
@@ -135,14 +159,27 @@ prepare_httpd() {
 	mkdir -p "$HTTPD_DOCUMENT_ROOT_PATH"
 	cp "$TEST_PATH"/passwd "$HTTPD_ROOT_PATH"
 	cp "$TEST_PATH"/proxy-passwd "$HTTPD_ROOT_PATH"
+	# Apache can run the following scripts concurrently per request. Make
+	# sure any state management logic is resilient to race conditions.
+	#
+	# For example:
+	#   - use "mkdir dir" to ensure only one request "succeeds" under some
+	#     condition (see http-429.sh).
+	#   - chain (&&) atomic operations like "rm marker" (no -f) with the
+	#     logic that is guarded by the marker instead of relying on a
+	#     separate "test -f" and "rm marker" check
+	#     (see apply-one-time-script.sh).
+	#   - use scratch file names that include the process ID ($$), so
+	#     concurrent requests do not overwrite each other's state.
 	install_script incomplete-length-upload-pack-v2-http.sh
 	install_script incomplete-body-upload-pack-v2-http.sh
 	install_script error-no-report.sh
 	install_script broken-smart-http.sh
 	install_script error-smart-http.sh
 	install_script error.sh
-	install_script apply-one-time-perl.sh
+	install_script apply-one-time-script.sh
 	install_script nph-custom-auth.sh
+	install_script http-429.sh
 
 	ln -s "$LIB_HTTPD_MODULE_PATH" "$HTTPD_ROOT_PATH/modules"
 
@@ -210,11 +247,10 @@ start_httpd() {
 
 	test_atexit stop_httpd
 
-	"$LIB_HTTPD_PATH" -d "$HTTPD_ROOT_PATH" \
+	if ! "$LIB_HTTPD_PATH" -d "$HTTPD_ROOT_PATH" \
 		-f "$TEST_PATH/apache.conf" $HTTPD_PARA \
 		-c "Listen 127.0.0.1:$LIB_HTTPD_PORT" -k start \
 		>&3 2>&4
-	if test $? -ne 0
 	then
 		cat "$HTTPD_ROOT_PATH"/error.log >&4 2>/dev/null
 		test_skip_or_die GIT_TEST_HTTPD "web server setup failed"
@@ -251,11 +287,11 @@ test_http_push_nonff () {
 	'
 
 	test_expect_success 'non-fast-forward push show ref status' '
-		grep "^ ! \[rejected\][ ]*$BRANCH -> $BRANCH (non-fast-forward)$" output
+		test_grep "^ ! \[rejected\][ ]*$BRANCH -> $BRANCH (non-fast-forward)$" output
 	'
 
 	test_expect_success 'non-fast-forward push shows help message' '
-		test_i18ngrep "Updates were rejected because" output
+		test_grep "Updates were rejected because" output
 	'
 
 	test_expect_${EXPECT_CAS_RESULT} 'force with lease aka cas' '
@@ -295,13 +331,22 @@ setup_askpass_helper() {
 	'
 }
 
-set_askpass() {
+set_askpass () {
 	>"$TRASH_DIRECTORY/askpass-query" &&
 	echo "$1" >"$TRASH_DIRECTORY/askpass-user" &&
 	echo "$2" >"$TRASH_DIRECTORY/askpass-pass"
 }
 
-expect_askpass() {
+set_netrc () {
+	# $HOME=$TRASH_DIRECTORY
+	echo "machine $1 login $2 password $3" >"$TRASH_DIRECTORY/.netrc"
+}
+
+clear_netrc () {
+	rm -f "$TRASH_DIRECTORY/.netrc"
+}
+
+expect_askpass () {
 	dest=$HTTPD_DEST${3+/$3}
 
 	{

@@ -3,10 +3,10 @@
 
 #include "gettext.h"
 #include "oid-array.h"
-#include "refs.h"
 #include "commit.h"
 #include "string-list.h"
 #include "strvec.h"
+#include "commit-reach.h"
 
 /* Quoting styles */
 #define QUOTE_NONE 0
@@ -19,10 +19,13 @@
 #define FILTER_REFS_BRANCHES       0x0004
 #define FILTER_REFS_REMOTES        0x0008
 #define FILTER_REFS_OTHERS         0x0010
-#define FILTER_REFS_ALL            (FILTER_REFS_TAGS | FILTER_REFS_BRANCHES | \
+#define FILTER_REFS_REGULAR        (FILTER_REFS_TAGS | FILTER_REFS_BRANCHES | \
 				    FILTER_REFS_REMOTES | FILTER_REFS_OTHERS)
 #define FILTER_REFS_DETACHED_HEAD  0x0020
-#define FILTER_REFS_KIND_MASK      (FILTER_REFS_ALL | FILTER_REFS_DETACHED_HEAD)
+#define FILTER_REFS_PSEUDOREFS     0x0040
+#define FILTER_REFS_ROOT_REFS      0x0080
+#define FILTER_REFS_KIND_MASK      (FILTER_REFS_REGULAR | FILTER_REFS_DETACHED_HEAD | \
+				    FILTER_REFS_PSEUDOREFS | FILTER_REFS_ROOT_REFS)
 
 struct atom_value;
 struct ref_sorting;
@@ -38,6 +41,7 @@ enum ref_sorting_order {
 
 struct ref_array_item {
 	struct object_id objectname;
+	struct object_id peeled_oid;
 	const char *rest;
 	int flag;
 	unsigned int kind;
@@ -45,6 +49,7 @@ struct ref_array_item {
 	struct commit *commit;
 	struct atom_value *value;
 	struct ahead_behind_count **counts;
+	char **is_base;
 
 	char refname[FLEX_ARRAY];
 };
@@ -60,7 +65,9 @@ struct ref_array {
 
 struct ref_filter {
 	const char **name_patterns;
+	const char *start_after;
 	struct strvec exclude;
+	struct strvec forked;
 	struct oid_array points_at;
 	struct commit_list *with_commit;
 	struct commit_list *no_commit;
@@ -75,6 +82,11 @@ struct ref_filter {
 		lines;
 	int abbrev,
 		verbose;
+
+	struct {
+		struct contains_cache contains_cache;
+		struct contains_cache no_contains_cache;
+	} internal;
 };
 
 struct ref_format {
@@ -85,30 +97,37 @@ struct ref_format {
 	const char *format;
 	const char *rest;
 	int quote_style;
-	int use_color;
+	enum git_colorbool use_color;
 
 	/* Internal state to ref-filter */
 	int need_color_reset_at_eol;
 
-	/* List of bases for ahead-behind counts. */
-	struct string_list bases;
+	struct {
+		int max_count;
+		int omit_empty;
+	} array_opts;
 };
 
 #define REF_FILTER_INIT { \
 	.points_at = OID_ARRAY_INIT, \
 	.exclude = STRVEC_INIT, \
+	.forked = STRVEC_INIT, \
 }
 #define REF_FORMAT_INIT {             \
-	.use_color = -1,              \
-	.bases = STRING_LIST_INIT_DUP, \
+	.use_color = GIT_COLOR_UNKNOWN, \
 }
 
 /*  Macros for checking --merged and --no-merged options */
-#define _OPT_MERGED_NO_MERGED(option, filter, h) \
-	{ OPTION_CALLBACK, 0, option, (filter), N_("commit"), (h), \
-	  PARSE_OPT_LASTARG_DEFAULT | PARSE_OPT_NONEG, \
-	  parse_opt_merge_filter, (intptr_t) "HEAD" \
-	}
+#define _OPT_MERGED_NO_MERGED(option, filter, h) { \
+	.type = OPTION_CALLBACK, \
+	.long_name = option, \
+	.value = (filter), \
+	.argh = N_("commit"), \
+	.help = (h), \
+	.flags = PARSE_OPT_LASTARG_DEFAULT | PARSE_OPT_NONEG, \
+	.callback = parse_opt_merge_filter, \
+	.defval = (intptr_t) "HEAD", \
+}
 #define OPT_MERGED(f, h) _OPT_MERGED_NO_MERGED("merged", f, h)
 #define OPT_NO_MERGED(f, h) _OPT_MERGED_NO_MERGED("no-merged", f, h)
 
@@ -119,6 +138,8 @@ struct ref_format {
 	OPT_STRVEC(0, "exclude", &(var)->exclude, \
 		   N_("pattern"), N_("exclude refs which match pattern"))
 
+/* Get the reference kind from the provided reference name. */
+int ref_kind_from_refname(const char *refname);
 /*
  * API for filtering a set of refs. Based on the type of refs the user
  * has requested, we iterate through those refs and apply filters
@@ -126,6 +147,14 @@ struct ref_format {
  * filtered refs in the ref_array structure.
  */
 int filter_refs(struct ref_array *array, struct ref_filter *filter, unsigned int type);
+/*
+ * Filter refs using the given ref_filter and type, sort the contents
+ * according to the given ref_sorting, format the filtered refs with the
+ * given ref_format, and print them to stdout.
+ */
+void filter_and_format_refs(struct ref_filter *filter, unsigned int type,
+			    struct ref_sorting *sorting,
+			    struct ref_format *format);
 /*  Clear all memory allocated to ref_array */
 void ref_array_clear(struct ref_array *array);
 /*  Used to verify if the given format is correct and to parse out the used atoms */
@@ -145,16 +174,31 @@ void ref_sorting_release(struct ref_sorting *);
 struct ref_sorting *ref_sorting_options(struct string_list *);
 /*  Function to parse --merged and --no-merged options */
 int parse_opt_merge_filter(const struct option *opt, const char *arg, int unset);
+/*
+ * Register a --forked <branch> pattern on the filter. The argument is
+ * either a ref, which is resolved to its full refname, or a shell-style
+ * glob. Branches are kept only when their configured upstream matches
+ * one of the registered patterns. Returns -1 if the argument is not a
+ * valid ref or pattern.
+ */
+int ref_filter_forked_add(struct ref_filter *filter, const char *arg);
 /*  Get the current HEAD's description */
 char *get_head_description(void);
 /*  Set up translated strings in the output. */
 void setup_ref_filter_porcelain_msg(void);
 
 /*
+ * Print up to maxcount ref_array elements to stdout using the given
+ * ref_format.
+ */
+void print_formatted_ref_array(struct ref_array *array, struct ref_format *format);
+
+/*
  * Print a single ref, outside of any ref-filter. Note that the
  * name must be a fully qualified refname.
  */
 void pretty_print_ref(const char *name, const struct object_id *oid,
+		      const struct object_id *peeled_oid,
 		      struct ref_format *format);
 
 /*
@@ -163,7 +207,8 @@ void pretty_print_ref(const char *name, const struct object_id *oid,
  */
 struct ref_array_item *ref_array_push(struct ref_array *array,
 				      const char *refname,
-				      const struct object_id *oid);
+				      const struct object_id *oid,
+				      const struct object_id *peeled_oid);
 
 /*
  * If the provided format includes ahead-behind atoms, then compute the
@@ -173,8 +218,16 @@ struct ref_array_item *ref_array_push(struct ref_array *array,
  * If this is not called, then any ahead-behind atoms will be blank.
  */
 void filter_ahead_behind(struct repository *r,
-			 struct ref_format *format,
 			 struct ref_array *array);
+
+/*
+ * If the provided format includes is-base atoms, then compute the base checks
+ * for those tips against all refs.
+ *
+ * If this is not called, then any is-base atoms will be blank.
+ */
+void filter_is_base(struct repository *r,
+		    struct ref_array *array);
 
 void ref_filter_init(struct ref_filter *filter);
 void ref_filter_clear(struct ref_filter *filter);

@@ -8,6 +8,12 @@ export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 . ./test-lib.sh
 
 test_expect_success 'setup' '
+	# Commit dates are hardcoded to 2005, and the reflog entries will have
+	# a matching timestamp. Maintenance may thus immediately expire
+	# reflogs if it was running.
+	git config set gc.reflogExpire never &&
+	git config set gc.reflogExpireUnreachable never &&
+
 	test_commit O fileO &&
 	test_commit X fileX &&
 	git branch fast-forward &&
@@ -33,56 +39,56 @@ test_expect_success 'rebase -m' '
 
 test_expect_success 'rebase against main twice' '
 	git rebase --apply main >out &&
-	test_i18ngrep "Current branch topic is up to date" out
+	test_grep "Current branch topic is up to date" out
 '
 
 test_expect_success 'rebase against main twice with --force' '
 	git rebase --force-rebase --apply main >out &&
-	test_i18ngrep "Current branch topic is up to date, rebase forced" out
+	test_grep "Current branch topic is up to date, rebase forced" out
 '
 
 test_expect_success 'rebase against main twice from another branch' '
 	git checkout topic^ &&
 	git rebase --apply main topic >out &&
-	test_i18ngrep "Current branch topic is up to date" out
+	test_grep "Current branch topic is up to date" out
 '
 
 test_expect_success 'rebase fast-forward to main' '
 	git checkout topic^ &&
 	git rebase --apply topic >out &&
-	test_i18ngrep "Fast-forwarded HEAD to topic" out
+	test_grep "Fast-forwarded HEAD to topic" out
 '
 
 test_expect_success 'rebase --stat' '
 	git reset --hard start &&
 	git rebase --stat main >diffstat.txt &&
-	grep "^ fileX |  *1 +$" diffstat.txt
+	test_grep "^ fileX |  *1 +$" diffstat.txt
 '
 
 test_expect_success 'rebase w/config rebase.stat' '
 	git reset --hard start &&
 	git config rebase.stat true &&
 	git rebase main >diffstat.txt &&
-	grep "^ fileX |  *1 +$" diffstat.txt
+	test_grep "^ fileX |  *1 +$" diffstat.txt
 '
 
 test_expect_success 'rebase -n overrides config rebase.stat config' '
 	git reset --hard start &&
 	git config rebase.stat true &&
 	git rebase -n main >diffstat.txt &&
-	! grep "^ fileX |  *1 +$" diffstat.txt
+	test_grep ! "^ fileX |  *1 +$" diffstat.txt
 '
 
 test_expect_success 'rebase --onto outputs the invalid ref' '
 	test_must_fail git rebase --onto invalid-ref HEAD HEAD 2>err &&
-	test_i18ngrep "invalid-ref" err
+	test_grep "invalid-ref" err
 '
 
 test_expect_success 'error out early upon -C<n> or --whitespace=<bad>' '
 	test_must_fail git rebase -Cnot-a-number HEAD 2>err &&
-	test_i18ngrep "numerical value" err &&
+	test_grep "numerical value" err &&
 	test_must_fail git rebase --whitespace=bad HEAD 2>err &&
-	test_i18ngrep "Invalid whitespace option" err
+	test_grep "Invalid whitespace option" err
 '
 
 write_reflog_expect () {
@@ -251,8 +257,8 @@ test_expect_success 'rebase -i onto unrelated history' '
 	git -C unrelated remote add -f origin "$PWD" &&
 	git -C unrelated branch --set-upstream-to=origin/main &&
 	git -C unrelated -c core.editor=true rebase -i -v --stat >actual &&
-	test_i18ngrep "Changes to " actual &&
-	test_i18ngrep "5 files changed" actual
+	test_grep "Changes to " actual &&
+	test_grep "5 files changed" actual
 '
 
 test_done

@@ -1,7 +1,9 @@
 #!/bin/sh
 
 test_description='commit graph'
+
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-chunk.sh
 
 GIT_TEST_COMMIT_GRAPH_CHANGED_PATHS=0
 
@@ -12,7 +14,7 @@ test_expect_success 'usage' '
 
 test_expect_success 'usage shown without sub-command' '
 	test_expect_code 129 git commit-graph 2>err &&
-	grep usage: err
+	test_grep usage: err
 '
 
 test_expect_success 'usage shown with an error on unknown sub-command' '
@@ -47,7 +49,7 @@ test_expect_success 'exit with correct error on bad input to --stdin-packs' '
 	echo doesnotexist >in &&
 	test_expect_code 1 git -C full commit-graph write --stdin-packs \
 		<in 2>stderr &&
-	test_i18ngrep "error adding pack" stderr
+	test_grep "error adding pack" stderr
 '
 
 test_expect_success 'create commits and repack' '
@@ -67,11 +69,11 @@ test_expect_success 'exit with correct error on bad input to --stdin-commits' '
 	# invalid, non-hex OID
 	echo HEAD | test_expect_code 1 git -C full commit-graph write \
 		--stdin-commits 2>stderr &&
-	test_i18ngrep "unexpected non-hex object ID: HEAD" stderr &&
+	test_grep "unexpected non-hex object ID: HEAD" stderr &&
 	# non-existent OID
 	echo $ZERO_OID | test_expect_code 1 git -C full commit-graph write \
 		--stdin-commits 2>stderr &&
-	test_i18ngrep "invalid object" stderr &&
+	test_grep "invalid object" stderr &&
 	# valid commit and tree OID
 	git -C full rev-parse HEAD HEAD^{tree} >in &&
 	git -C full commit-graph write --stdin-commits <in &&
@@ -143,7 +145,7 @@ test_expect_success 'commit-graph write --stdin-commits force progress on for st
 	git -C full rev-parse commits/5 >in &&
 	GIT_PROGRESS_DELAY=0 git -C full commit-graph write --stdin-commits \
 		--progress <in 2>err &&
-	test_i18ngrep "Collecting commits from input" err
+	test_grep "Collecting commits from input" err
 '
 
 test_expect_success 'commit-graph write --stdin-commits with the --no-progress option' '
@@ -383,13 +385,13 @@ test_expect_success 'warn on improper hash version' '
 		cd sha1 &&
 		mv ../cg-sha256 .git/objects/info/commit-graph &&
 		git log -1 2>err &&
-		test_i18ngrep "commit-graph hash version 2 does not match version 1" err
+		test_grep "commit-graph hash version 2 does not match version 1" err
 	) &&
 	(
 		cd sha256 &&
 		mv ../cg-sha1 .git/objects/info/commit-graph &&
 		git log -1 2>err &&
-		test_i18ngrep "commit-graph hash version 1 does not match version 2" err
+		test_grep "commit-graph hash version 1 does not match version 2" err
 	)
 '
 
@@ -413,6 +415,26 @@ test_expect_success TIME_IS_64BIT,TIME_T_IS_64BIT 'lower layers have overflow ch
 	graph_read_expect -C full 16 \
 		"generation_data generation_data_overflow extra_edges" &&
 	test_cmp full/.git/objects/info/commit-graph commit-graph-upgraded
+'
+
+test_expect_success TIME_IS_64BIT,TIME_T_IS_64BIT 'overflow chunk when replacing commit-graph' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		cat >commit <<-EOF &&
+		tree $(test_oid empty_tree)
+		author Example <committer@example.com> 9223372036854775 +0000
+		committer Example <committer@example.com> 9223372036854775 +0000
+
+		Weird commit date
+		EOF
+		commit_id=$(git hash-object -t commit -w commit) &&
+		git reset --hard "$commit_id" &&
+		git commit-graph write --reachable &&
+		git commit-graph write --reachable --split=replace &&
+		git log
+	)
 '
 
 # the verify tests below expect the commit-graph to contain
@@ -474,7 +496,7 @@ corrupt_graph_verify() {
 	grepstr=$1
 	test_must_fail git -C full commit-graph verify 2>test_err &&
 	grep -v "^+" test_err >err &&
-	test_i18ngrep "$grepstr" err &&
+	test_grep "$grepstr" err &&
 	if test "$2" != "no-copy"
 	then
 		cp full/$objdir/info/commit-graph commit-graph-pre-write-test
@@ -539,17 +561,17 @@ test_expect_success 'detect low chunk count' '
 
 test_expect_success 'detect missing OID fanout chunk' '
 	corrupt_graph_and_verify $GRAPH_BYTE_OID_FANOUT_ID "\0" \
-		"missing the OID Fanout chunk"
+		"commit-graph required OID fanout chunk missing or corrupted"
 '
 
 test_expect_success 'detect missing OID lookup chunk' '
 	corrupt_graph_and_verify $GRAPH_BYTE_OID_LOOKUP_ID "\0" \
-		"missing the OID Lookup chunk"
+		"commit-graph required OID lookup chunk missing or corrupted"
 '
 
 test_expect_success 'detect missing commit data chunk' '
 	corrupt_graph_and_verify $GRAPH_BYTE_COMMIT_DATA_ID "\0" \
-		"missing the Commit Data chunk"
+		"commit-graph required commit data chunk missing or corrupted"
 '
 
 test_expect_success 'detect incorrect fanout' '
@@ -559,7 +581,7 @@ test_expect_success 'detect incorrect fanout' '
 
 test_expect_success 'detect incorrect fanout final value' '
 	corrupt_graph_and_verify $GRAPH_BYTE_FANOUT2 "\01" \
-		"fanout value"
+		"OID lookup chunk is the wrong size"
 '
 
 test_expect_success 'detect incorrect OID order' '
@@ -657,12 +679,12 @@ test_expect_success 'git fsck (checks commit-graph when config unset)' '
 
 test_expect_success 'git fsck shows commit-graph output with --progress' '
 	git -C "$TRASH_DIRECTORY/full" fsck --progress 2>err &&
-	grep "Verifying commits in commit graph" err
+	test_grep "Verifying commits in commit graph" err
 '
 
 test_expect_success 'git fsck suppresses commit-graph output with --no-progress' '
 	git -C "$TRASH_DIRECTORY/full" fsck --no-progress 2>err &&
-	! grep "Verifying commits in commit graph" err
+	test_grep ! "Verifying commits in commit graph" err
 '
 
 test_expect_success 'setup non-the_repository tests' '
@@ -720,7 +742,7 @@ test_expect_success 'corrupt commit-graph write (broken parent)' '
 		git commit-tree -p "$broken" -m "good commit" "$empty" >good &&
 		test_must_fail git commit-graph write --stdin-commits \
 			<good 2>test_err &&
-		test_i18ngrep "unable to parse commit" test_err
+		test_grep "unable to parse commit" test_err
 	)
 '
 
@@ -741,7 +763,7 @@ test_expect_success 'corrupt commit-graph write (missing tree)' '
 		git commit-tree -p "$broken" -m "good" "$tree" >good &&
 		test_must_fail git commit-graph write --stdin-commits \
 			<good 2>test_err &&
-		test_i18ngrep "unable to parse commit" test_err
+		test_grep "unable to parse commit" test_err
 	)
 '
 
@@ -818,6 +840,173 @@ test_expect_success 'overflow during generation version upgrade' '
 			--changed-paths &&
 
 		git rev-list --all
+	)
+'
+
+corrupt_chunk () {
+	graph=full/.git/objects/info/commit-graph &&
+	test_when_finished "rm -rf $graph" &&
+	git -C full commit-graph write --reachable &&
+	corrupt_chunk_file $graph "$@"
+}
+
+check_corrupt_chunk () {
+	corrupt_chunk "$@" &&
+	git -C full -c core.commitGraph=false log >expect.out &&
+	git -C full -c core.commitGraph=true log >out 2>err &&
+	test_cmp expect.out out
+}
+
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small oid fanout chunk' '
+	# make it big enough that the graph file is plausible,
+	# otherwise we hit an earlier check
+	check_corrupt_chunk OIDF clear $(printf "000000%02x" $(test_seq 250)) &&
+	cat >expect.err <<-\EOF &&
+	error: commit-graph oid fanout chunk is wrong size
+	error: commit-graph required OID fanout chunk missing or corrupted
+	EOF
+	test_cmp expect.err err
+'
+
+test_expect_success PERL_TEST_HELPERS 'reader notices fanout/lookup table mismatch' '
+	check_corrupt_chunk OIDF 1020 "FFFFFFFF" &&
+	cat >expect.err <<-\EOF &&
+	error: commit-graph OID lookup chunk is the wrong size
+	error: commit-graph required OID lookup chunk missing or corrupted
+	EOF
+	test_cmp expect.err err
+'
+
+test_expect_success PERL_TEST_HELPERS 'reader notices out-of-bounds fanout' '
+	# Rather than try to corrupt a specific hash, we will just
+	# wreck them all. But we cannot just set them all to 0xFFFFFFFF or
+	# similar, as they are used for hi/lo starts in a binary search (so if
+	# they are identical, that indicates that the search should abort
+	# immediately). Instead, we will give them high values that differ by
+	# 2^24, ensuring that any that are used would cause an out-of-bounds
+	# read.
+	check_corrupt_chunk OIDF 0 $(printf "%02x000000" $(test_seq 0 254)) &&
+	cat >expect.err <<-\EOF &&
+	error: commit-graph fanout values out of order
+	error: commit-graph required OID fanout chunk missing or corrupted
+	EOF
+	test_cmp expect.err err
+'
+
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small commit data chunk' '
+	check_corrupt_chunk CDAT clear 00000000 &&
+	cat >expect.err <<-\EOF &&
+	error: commit-graph commit data chunk is wrong size
+	error: commit-graph required commit data chunk missing or corrupted
+	EOF
+	test_cmp expect.err err
+'
+
+test_expect_success PERL_TEST_HELPERS 'reader notices out-of-bounds extra edge' '
+	check_corrupt_chunk EDGE clear &&
+	cat >expect.err <<-\EOF &&
+	error: commit-graph extra-edges pointer out of bounds
+	EOF
+	test_cmp expect.err err
+'
+
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small generations chunk' '
+	check_corrupt_chunk GDA2 clear 00000000 &&
+	cat >expect.err <<-\EOF &&
+	error: commit-graph generations chunk is wrong size
+	EOF
+	test_cmp expect.err err
+'
+
+test_expect_success 'stale commit cannot be parsed when given directly' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		test_commit B &&
+		git commit-graph write --reachable &&
+
+		oid=$(git rev-parse B) &&
+		rm .git/objects/"$(test_oid_to_path "$oid")" &&
+
+		# Verify that it is possible to read the commit from the
+		# commit graph when not being paranoid, ...
+		git rev-list B &&
+		# ... but parsing the commit when double checking that
+		# it actually exists in the object database should fail.
+		test_must_fail env GIT_COMMIT_GRAPH_PARANOIA=true git rev-list -1 B
+	)
+'
+
+test_expect_success 'stale commit cannot be parsed when traversing graph' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		test_commit A &&
+		test_commit B &&
+		test_commit C &&
+		git commit-graph write --reachable &&
+
+		# Corrupt the repository by deleting the intermediate commit
+		# object. Commands should notice that this object is absent and
+		# thus that the repository is corrupt even if the commit graph
+		# exists.
+		oid=$(git rev-parse B) &&
+		rm .git/objects/"$(test_oid_to_path "$oid")" &&
+
+		# Again, we should be able to parse the commit when not
+		# being paranoid about commit graph staleness...
+		git rev-parse HEAD~2 &&
+		# ... but fail when we are paranoid.
+		test_must_fail env GIT_COMMIT_GRAPH_PARANOIA=true git rev-parse HEAD~2 2>error &&
+		test_grep "error: commit $oid exists in commit-graph but not in the object database" error
+	)
+'
+
+test_expect_success 'config commitGraph.changedPaths acts like --changed-paths' '
+	git init config-changed-paths &&
+	(
+		cd config-changed-paths &&
+
+		# commitGraph.changedPaths is not set and it should not write Bloom filters
+		test_commit first &&
+		GIT_PROGRESS_DELAY=0 git commit-graph write --reachable --progress 2>error &&
+		test_grep ! "Bloom filters" error &&
+
+		# Set commitGraph.changedPaths to true and it should write Bloom filters
+		test_commit second &&
+		git config commitGraph.changedPaths true &&
+		GIT_PROGRESS_DELAY=0 git commit-graph write --reachable --progress 2>error &&
+		test_grep "Bloom filters" error &&
+
+		# Add one more config commitGraph.changedPaths as false to disable the previous true config value
+		# It should still write Bloom filters due to existing filters
+		test_commit third &&
+		git config --add commitGraph.changedPaths false &&
+		GIT_PROGRESS_DELAY=0 git commit-graph write --reachable --progress 2>error &&
+		test_grep "Bloom filters" error &&
+
+		# commitGraph.changedPaths is still false and command line options should take precedence
+		test_commit fourth &&
+		GIT_PROGRESS_DELAY=0 git commit-graph write --no-changed-paths --reachable --progress 2>error &&
+		test_grep ! "Bloom filters" error &&
+		GIT_PROGRESS_DELAY=0 git commit-graph write --reachable --progress 2>error &&
+		test_grep ! "Bloom filters" error &&
+
+		# commitGraph.changedPaths is all cleared and then set to false again, command line options should take precedence
+		test_commit fifth &&
+		git config --unset-all commitGraph.changedPaths &&
+		git config commitGraph.changedPaths false &&
+		GIT_PROGRESS_DELAY=0 git commit-graph write --changed-paths --reachable --progress 2>error &&
+		test_grep "Bloom filters" error &&
+
+		# commitGraph.changedPaths is still false and it should write Bloom filters due to existing filters
+		test_commit sixth &&
+		GIT_PROGRESS_DELAY=0 git commit-graph write --reachable --progress 2>error &&
+		test_grep "Bloom filters" error
 	)
 '
 

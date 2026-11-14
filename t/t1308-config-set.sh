@@ -2,7 +2,6 @@
 
 test_description='Test git config-set API in different settings'
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 
 # 'check_config get_* section.key value' verifies that the entry for
@@ -172,7 +171,7 @@ test_expect_success 'find string value for a key' '
 
 test_expect_success 'check line error when NULL string is queried' '
 	test_expect_code 128 test-tool config get_string case.foo 2>result &&
-	test_i18ngrep "fatal: .*case\.foo.*\.git/config.*line 7" result
+	test_grep "fatal: .*case\.foo.*\.git/config.*line 7" result
 '
 
 test_expect_success 'find integer if value is non parse-able' '
@@ -181,7 +180,7 @@ test_expect_success 'find integer if value is non parse-able' '
 
 test_expect_success 'non parse-able integer value during iteration' '
 	check_config expect_code 128 git_config_int lamb.head 2>result &&
-	grep "fatal: bad numeric config value .* in file \.git/config" result
+	test_grep "fatal: bad numeric config value .* in file \.git/config" result
 '
 
 test_expect_success 'find bool value for the entered key' '
@@ -303,7 +302,7 @@ test_expect_success 'proper error on directory "files"' '
 	echo "Error (-1) reading configuration file a-directory." >expect &&
 	mkdir a-directory &&
 	test_expect_code 2 test-tool config configset_get_value foo.bar a-directory 2>output &&
-	grep "^warning:" output &&
+	test_grep "^warning:" output &&
 	grep "^Error" output >actual &&
 	test_cmp expect actual
 '
@@ -313,7 +312,7 @@ test_expect_success POSIXPERM,SANITY 'proper error on non-accessible files' '
 	test_when_finished "chmod +r .git/config" &&
 	echo "Error (-1) reading configuration file .git/config." >expect &&
 	test_expect_code 2 test-tool config configset_get_value foo.bar .git/config 2>output &&
-	grep "^warning:" output &&
+	test_grep "^warning:" output &&
 	grep "^Error" output >actual &&
 	test_cmp expect actual
 '
@@ -342,14 +341,14 @@ test_expect_success 'check line errors for malformed values' '
 		br
 	EOF
 	test_expect_code 128 git br 2>result &&
-	test_i18ngrep "missing value for .alias\.br" result &&
-	test_i18ngrep "fatal: .*\.git/config" result &&
-	test_i18ngrep "fatal: .*line 2" result
+	test_grep "missing value for .alias\.br" result &&
+	test_grep "fatal: .*\.git/config" result &&
+	test_grep "fatal: .*line 2" result
 '
 
 test_expect_success 'error on modifying repo config without repo' '
 	nongit test_must_fail git config a.b c 2>err &&
-	test_i18ngrep "not in a git directory" err
+	test_grep "not in a git directory" err
 '
 
 cmdline_config="'foo.bar=from-cmdline'"

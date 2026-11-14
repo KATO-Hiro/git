@@ -1,6 +1,25 @@
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "git-compat-util.h"
 #include "environment.h"
 #include "statinfo.h"
+#include "repository.h"
+
+/*
+ * Munge st_size into an unsigned int.
+ */
+static unsigned int munge_st_size(off_t st_size) {
+	unsigned int sd_size = st_size;
+
+	/*
+	 * If the file is an exact multiple of 4 GiB, modify the value so it
+	 * doesn't get marked as racily clean (zero).
+	 */
+	if (!sd_size && st_size)
+		return 0x80000000;
+	else
+		return sd_size;
+}
 
 void fill_stat_data(struct stat_data *sd, struct stat *st)
 {
@@ -12,28 +31,56 @@ void fill_stat_data(struct stat_data *sd, struct stat *st)
 	sd->sd_ino = st->st_ino;
 	sd->sd_uid = st->st_uid;
 	sd->sd_gid = st->st_gid;
-	sd->sd_size = st->st_size;
+	sd->sd_size = munge_st_size(st->st_size);
+}
+
+static void set_times(struct stat *st, const struct stat_data *sd)
+{
+	st->st_ctime = sd->sd_ctime.sec;
+	st->st_mtime = sd->sd_mtime.sec;
+#ifdef NO_NSEC
+	; /* nothing */
+#else
+#ifdef USE_ST_TIMESPEC
+	st->st_ctimespec.tv_nsec = sd->sd_ctime.nsec;
+	st->st_mtimespec.tv_nsec = sd->sd_mtime.nsec;
+#else
+	st->st_ctim.tv_nsec = sd->sd_ctime.nsec;
+	st->st_mtim.tv_nsec = sd->sd_mtime.nsec;
+#endif
+#endif
+}
+
+void fake_lstat_data(const struct stat_data *sd, struct stat *st)
+{
+	set_times(st, sd);
+	st->st_dev = sd->sd_dev;
+	st->st_ino = sd->sd_ino;
+	st->st_uid = sd->sd_uid;
+	st->st_gid = sd->sd_gid;
+	st->st_size = sd->sd_size;
 }
 
 int match_stat_data(const struct stat_data *sd, struct stat *st)
 {
 	int changed = 0;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	if (sd->sd_mtime.sec != (unsigned int)st->st_mtime)
 		changed |= MTIME_CHANGED;
-	if (trust_ctime && check_stat &&
+	if (cfg->trust_ctime && cfg->check_stat &&
 	    sd->sd_ctime.sec != (unsigned int)st->st_ctime)
 		changed |= CTIME_CHANGED;
 
-#ifdef USE_NSEC
-	if (check_stat && sd->sd_mtime.nsec != ST_MTIME_NSEC(*st))
-		changed |= MTIME_CHANGED;
-	if (trust_ctime && check_stat &&
-	    sd->sd_ctime.nsec != ST_CTIME_NSEC(*st))
-		changed |= CTIME_CHANGED;
-#endif
+	if (cfg->use_nanosec) {
+		if (cfg->check_stat && sd->sd_mtime.nsec != ST_MTIME_NSEC(*st))
+			changed |= MTIME_CHANGED;
+		if (cfg->trust_ctime && cfg->check_stat &&
+		    sd->sd_ctime.nsec != ST_CTIME_NSEC(*st))
+			changed |= CTIME_CHANGED;
+	}
 
-	if (check_stat) {
+	if (cfg->check_stat) {
 		if (sd->sd_uid != (unsigned int) st->st_uid ||
 			sd->sd_gid != (unsigned int) st->st_gid)
 			changed |= OWNER_CHANGED;
@@ -47,11 +94,11 @@ int match_stat_data(const struct stat_data *sd, struct stat *st)
 	 * clients will have different views of what "device"
 	 * the filesystem is on
 	 */
-	if (check_stat && sd->sd_dev != (unsigned int) st->st_dev)
+	if (cfg->check_stat && sd->sd_dev != (unsigned int) st->st_dev)
 			changed |= INODE_CHANGED;
 #endif
 
-	if (sd->sd_size != (unsigned int) st->st_size)
+	if (sd->sd_size != munge_st_size(st->st_size))
 		changed |= DATA_CHANGED;
 
 	return changed;

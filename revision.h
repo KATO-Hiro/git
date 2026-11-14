@@ -4,12 +4,15 @@
 #include "commit.h"
 #include "grep.h"
 #include "notes.h"
+#include "object-name.h"
+#include "oidset.h"
 #include "pretty.h"
 #include "diff.h"
 #include "commit-slab-decl.h"
 #include "decorate.h"
 #include "ident.h"
 #include "list-objects-filter-options.h"
+#include "prio-queue.h"
 #include "strvec.h"
 
 /**
@@ -51,7 +54,9 @@
 #define NOT_USER_GIVEN	(1u<<25)
 #define TRACK_LINEAR	(1u<<26)
 #define ANCESTRY_PATH	(1u<<27)
-#define ALL_REV_FLAGS	(((1u<<11)-1) | NOT_USER_GIVEN | TRACK_LINEAR | PULL_MERGE)
+#define CHILD_VISITED	(1u<<28)
+#define ALL_REV_FLAGS	(((1u<<11)-1) | NOT_USER_GIVEN | TRACK_LINEAR \
+				      | PULL_MERGE | CHILD_VISITED)
 
 #define DECORATE_SHORT_REFS	1
 #define DECORATE_FULL_REFS	2
@@ -61,7 +66,8 @@ struct repository;
 struct rev_info;
 struct string_list;
 struct saved_parents;
-struct bloom_key;
+struct follow_pathspec_slab;
+struct bloom_keyvec;
 struct bloom_filter_settings;
 struct option;
 struct parse_opt_ctx_t;
@@ -118,8 +124,14 @@ struct oidset;
 struct topo_walk_info;
 
 struct rev_info {
-	/* Starting list */
+	/*
+	 * Work queue of commits, stored as either a linked list or a
+	 * priority queue, but never both at the same time.
+	 * rev_info_commit_list_to_queue() converts list to queue.
+	 */
 	struct commit_list *commits;
+	struct prio_queue commit_queue;
+
 	struct object_array pending;
 	struct repository *repo;
 
@@ -141,6 +153,7 @@ struct rev_info {
 	/* Basic information */
 	const char *prefix;
 	const char *def;
+	char *ps_matched; /* optionally record matches of prune_data */
 	struct pathspec prune_data;
 
 	/*
@@ -157,8 +170,6 @@ struct rev_info {
 
 	/* topo-sort */
 	enum rev_sort_order sort_order;
-
-	unsigned int early_output;
 
 	unsigned int	ignore_missing:1,
 			ignore_missing_links:1;
@@ -189,6 +200,7 @@ struct rev_info {
 			left_right:1,
 			left_only:1,
 			right_only:1,
+			maximal_only:1,
 			rewrite_parents:1,
 			print_parents:1,
 			show_decorations:1,
@@ -212,18 +224,19 @@ struct rev_info {
 
 			/*
 			 * Blobs are shown without regard for their existence.
-			 * But not so for trees: unless exclude_promisor_objects
+			 * But not so for trees/commits: unless exclude_promisor_objects
 			 * is set and the tree in question is a promisor object;
 			 * OR ignore_missing_links is set, the revision walker
-			 * dies with a "bad tree object HASH" message when
-			 * encountering a missing tree. For callers that can
-			 * handle missing trees and want them to be filterable
+			 * dies with a "bad <type> object HASH" message when
+			 * encountering a missing object. For callers that can
+			 * handle missing trees/commits and want them to be filterable
 			 * and showable, set this to true. The revision walker
-			 * will filter and show such a missing tree as usual,
-			 * but will not attempt to recurse into this tree
-			 * object.
+			 * will filter and show such a missing object as usual,
+			 * but will not attempt to recurse into this tree/commit
+			 * object. The revision walker will also set the MISSING
+			 * flag for such objects.
 			 */
-			do_not_die_on_missing_tree:1,
+			do_not_die_on_missing_objects:1,
 
 			/* for internal use only */
 			exclude_promisor_objects:1;
@@ -253,6 +266,7 @@ struct rev_info {
 			shown_dashes:1,
 			show_merge:1,
 			show_notes_given:1,
+			show_notes_by_default:1,
 			show_signature:1,
 			pretty_given:1,
 			abbrev_commit:1,
@@ -288,7 +302,6 @@ struct rev_info {
 	struct string_list *ref_message_ids;
 	int		add_signoff;
 	const char	*extra_headers;
-	const char	*log_reencode;
 	const char	*subject_prefix;
 	int		patch_name_max;
 	int		no_inline;
@@ -300,10 +313,15 @@ struct rev_info {
 
 	/* Display history graph */
 	struct git_graph *graph;
+	int graph_max_lanes;
+	unsigned int no_graph_indent:1;
+	unsigned int graph_indent_set:1;
 
 	/* special limits */
 	int skip_count;
 	int max_count;
+	unsigned int max_count_type:1;
+	unsigned int max_count_stage:1;
 	timestamp_t max_age;
 	timestamp_t max_age_as_filter;
 	timestamp_t min_age;
@@ -333,6 +351,7 @@ struct rev_info {
 	/* range-diff */
 	const char *rdiff1;
 	const char *rdiff2;
+	struct strvec rdiff_log_arg;
 	int creation_factor;
 	const char *rdiff_title;
 
@@ -347,6 +366,9 @@ struct rev_info {
 	/* copies of the parent lists, for --full-diff display */
 	struct saved_parents *saved_parents_slab;
 
+	/* per-commit pathspec for --follow across merges */
+	struct follow_pathspec_slab *follow_pathspec_slab;
+
 	struct commit_list *previous_parents;
 	struct commit_list *ancestry_path_bottoms;
 	const char *break_bar;
@@ -357,8 +379,8 @@ struct rev_info {
 
 	/* Commit graph bloom filter fields */
 	/* The bloom filter key(s) for the pathspec */
-	struct bloom_key *bloom_keys;
-	int bloom_keys_nr;
+	struct bloom_keyvec **bloom_keyvecs;
+	int bloom_keyvecs_nr;
 
 	/*
 	 * The bloom filter settings used to generate the key.
@@ -371,6 +393,17 @@ struct rev_info {
 
 	/* Location where temporary objects for remerge-diff are written. */
 	struct tmp_objdir *remerge_objdir;
+
+	/* Missing commits to be tracked without failing traversal. */
+	struct oidset missing_commits;
+
+	/*
+	 * Strings whose ownership has been handed over to us, but which
+	 * we may be referencing in any of the above options (including
+	 * within the diffopt struct). These will remain valid until
+	 * release_revisions() is called.
+	 */
+	struct strvec argv_to_free;
 };
 
 /**
@@ -391,6 +424,7 @@ struct rev_info {
  * uninitialized.
  */
 #define REV_INFO_INIT { \
+	.commit_queue = { .compare = compare_commits_by_commit_date }, \
 	.abbrev = DEFAULT_ABBREV, \
 	.simplify_history = 1, \
 	.pruning.flags.recursive = 1, \
@@ -406,6 +440,8 @@ struct rev_info {
 	.expand_tabs_in_log = -1, \
 	.commit_format = CMIT_FMT_DEFAULT, \
 	.expand_tabs_in_log_default = 8, \
+	.rdiff_log_arg = STRVEC_INIT, \
+	.argv_to_free = STRVEC_INIT, \
 }
 
 /**
@@ -437,6 +473,8 @@ struct setup_revision_opt {
 };
 int setup_revisions(int argc, const char **argv, struct rev_info *revs,
 		    struct setup_revision_opt *);
+void setup_revisions_from_strvec(struct strvec *argv, struct rev_info *revs,
+				 struct setup_revision_opt *);
 
 /**
  * Free data allocated in a "struct rev_info" after it's been
@@ -466,6 +504,8 @@ void reset_revision_walk(void);
  */
 int prepare_revision_walk(struct rev_info *revs);
 
+/* Drain the commits linked list into the priority queue. */
+void rev_info_commit_list_to_queue(struct rev_info *revs);
 /**
  * Takes a pointer to a `rev_info` structure and iterates over it, returning a
  * `struct commit *` each time you call it. The end of the revision list is
@@ -481,8 +521,6 @@ void put_revision_mark(const struct rev_info *revs,
 void mark_parents_uninteresting(struct rev_info *revs, struct commit *commit);
 void mark_tree_uninteresting(struct repository *r, struct tree *tree);
 void mark_trees_uninteresting_sparse(struct repository *r, struct oidset *trees);
-
-void show_object_with_name(FILE *, struct object *, const char *);
 
 /**
  * Helpers to check if a reference should be excluded.
@@ -542,17 +580,11 @@ int rewrite_parents(struct rev_info *revs,
  * The log machinery saves the original parent list so that
  * get_saved_parents() can later tell what the real parents of the
  * commits are, when commit->parents has been modified by history
- * simpification.
+ * simplification.
  *
  * get_saved_parents() will transparently return commit->parents if
  * history simplification is off.
  */
 struct commit_list *get_saved_parents(struct rev_info *revs, const struct commit *commit);
-
-/**
- * Global for the (undocumented) "--early-output" flag for "git log".
- */
-typedef void (*show_early_output_fn_t)(struct rev_info *, struct commit_list *);
-extern volatile show_early_output_fn_t show_early_output;
 
 #endif
